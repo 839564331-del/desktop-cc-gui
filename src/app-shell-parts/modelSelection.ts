@@ -1,0 +1,215 @@
+import type { ComposerSessionSelection } from "./selectedComposerSession";
+import type { EngineType, ModelOption } from "../types";
+
+type GetEffectiveSelectedModelIdOptions = {
+  activeEngine: EngineType;
+  selectedModelId: string | null;
+  activeThreadSelectedModelId: string | null;
+  hasActiveThread: boolean;
+  codexModels: ModelOption[];
+  engineModelsAsOptions: ModelOption[];
+  engineSelectedModelIdByType: Partial<Record<EngineType, string | null>>;
+};
+
+type GetNextEngineSelectedModelIdOptions = {
+  activeEngine: EngineType;
+  engineModelsAsOptions: ModelOption[];
+  currentSelection: string | null;
+};
+
+type UpsertEngineSelectedModelIdOptions = {
+  activeEngine: EngineType;
+  nextModelId: string | null;
+  previousSelectionByEngine: Partial<Record<EngineType, string | null>>;
+};
+
+type GetEffectiveSelectedEffortOptions = {
+  activeEngine: EngineType;
+  hasActiveThread: boolean;
+  selectedEffort: string | null;
+  activeThreadSelection: ComposerSessionSelection | null;
+  reasoningOptions: string[];
+};
+
+export const CLAUDE_REASONING_OPTIONS = ["low", "medium", "high", "xhigh", "max"];
+
+function findModelById(models: ModelOption[], id: string | null) {
+  if (!id) {
+    return null;
+  }
+  return (
+    models.find((model) => model.id === id) ??
+    models.find((model) => model.model === id) ??
+    null
+  );
+}
+
+function getDefaultModelId(models: ModelOption[]) {
+  return models.find((model) => model.isDefault)?.id ?? models[0]?.id ?? null;
+}
+
+function normalizeReasoningEffort(value: unknown): string | null {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+function getNormalizedReasoningOptions(reasoningOptions: string[]) {
+  return Array.from(
+    new Set(reasoningOptions.map((option) => option.trim()).filter(Boolean)),
+  );
+}
+
+export function isReasoningEffortSupportedForEngine(
+  activeEngine: EngineType,
+  reasoningOptions: string[],
+) {
+  if (activeEngine === "claude") {
+    return true;
+  }
+  if (activeEngine === "codex") {
+    return getNormalizedReasoningOptions(reasoningOptions).length > 0;
+  }
+  return false;
+}
+
+export function getEffectiveModels(
+  activeEngine: EngineType,
+  codexModels: ModelOption[],
+  engineModelsAsOptions: ModelOption[],
+) {
+  return activeEngine === "codex" ? codexModels : engineModelsAsOptions;
+}
+
+export function getNextEngineSelectedModelId({
+  activeEngine,
+  engineModelsAsOptions,
+  currentSelection,
+}: GetNextEngineSelectedModelIdOptions) {
+  if (activeEngine === "codex" || engineModelsAsOptions.length === 0) {
+    return null;
+  }
+  if (findModelById(engineModelsAsOptions, currentSelection)) {
+    return null;
+  }
+  return getDefaultModelId(engineModelsAsOptions);
+}
+
+export function upsertEngineSelectedModelId({
+  activeEngine,
+  nextModelId,
+  previousSelectionByEngine,
+}: UpsertEngineSelectedModelIdOptions) {
+  if (!nextModelId) {
+    return previousSelectionByEngine;
+  }
+  const existing = previousSelectionByEngine[activeEngine] ?? null;
+  if (nextModelId === existing) {
+    return previousSelectionByEngine;
+  }
+  return { ...previousSelectionByEngine, [activeEngine]: nextModelId };
+}
+
+export function getEffectiveSelectedModelId({
+  activeEngine,
+  selectedModelId,
+  activeThreadSelectedModelId,
+  hasActiveThread,
+  codexModels,
+  engineModelsAsOptions,
+  engineSelectedModelIdByType,
+}: GetEffectiveSelectedModelIdOptions) {
+  if (activeEngine === "codex") {
+    const selectedCodexModelId = findModelById(codexModels, selectedModelId)?.id ?? null;
+    const threadCodexModelId =
+      findModelById(codexModels, activeThreadSelectedModelId)?.id ?? null;
+    const defaultCodexModelId = getDefaultModelId(codexModels);
+    if (hasActiveThread) {
+      return threadCodexModelId ?? selectedCodexModelId ?? defaultCodexModelId;
+    }
+    return selectedCodexModelId ?? defaultCodexModelId;
+  }
+  const engineSelection = engineSelectedModelIdByType[activeEngine] ?? null;
+  if (engineModelsAsOptions.length === 0) {
+    if (hasActiveThread) {
+      return activeEngine === "claude" ? null : activeThreadSelectedModelId;
+    }
+    return activeEngine === "claude" ? null : engineSelection;
+  }
+  if (hasActiveThread) {
+    return (
+      findModelById(engineModelsAsOptions, activeThreadSelectedModelId)?.id ??
+      getDefaultModelId(engineModelsAsOptions)
+    );
+  }
+  return (
+    findModelById(engineModelsAsOptions, engineSelection)?.id ??
+    getDefaultModelId(engineModelsAsOptions)
+  );
+}
+
+export function getEffectiveSelectedEffort({
+  activeEngine,
+  hasActiveThread,
+  selectedEffort,
+  activeThreadSelection,
+  reasoningOptions,
+}: GetEffectiveSelectedEffortOptions) {
+  const normalizedReasoningOptions = getNormalizedReasoningOptions(reasoningOptions);
+  const normalizeEffort = (value: string | null, options?: { fallbackToFirst: boolean }) => {
+    if (typeof value !== "string") {
+      return null;
+    }
+    const trimmed = value.trim();
+    if (!trimmed) {
+      return null;
+    }
+    if (
+      normalizedReasoningOptions.length > 0 &&
+      !normalizedReasoningOptions.includes(trimmed)
+    ) {
+      return options?.fallbackToFirst ? normalizedReasoningOptions[0] ?? null : null;
+    }
+    return trimmed;
+  };
+  if (!isReasoningEffortSupportedForEngine(activeEngine, normalizedReasoningOptions)) {
+    return null;
+  }
+  if (activeEngine === "claude") {
+    return normalizeEffort(activeThreadSelection?.effort ?? null, {
+      fallbackToFirst: false,
+    });
+  }
+  if (activeEngine !== "codex" || !hasActiveThread) {
+    return normalizeEffort(selectedEffort, { fallbackToFirst: true });
+  }
+  if (!activeThreadSelection) {
+    return normalizeEffort(selectedEffort, { fallbackToFirst: true });
+  }
+  return normalizeEffort(activeThreadSelection.effort, { fallbackToFirst: true });
+}
+
+export function getReasoningOptionsForModel(model: ModelOption | null): string[] {
+  const supported = model?.supportedReasoningEfforts.map((effort) => effort.reasoningEffort) ?? [];
+  if (supported.length > 0) {
+    return supported;
+  }
+  const defaultEffort = normalizeReasoningEffort(model?.defaultReasoningEffort);
+  return defaultEffort ? [defaultEffort] : [];
+}
+
+export function getEffectiveReasoningSupported(
+  activeEngine: EngineType,
+  codexReasoningSupported: boolean,
+) {
+  return activeEngine === "claude" || (activeEngine === "codex" && codexReasoningSupported);
+}
+
+export function getEffectiveReasoningOptions(
+  activeEngine: EngineType,
+  modelReasoningOptions: string[],
+): string[] {
+  return activeEngine === "claude" ? CLAUDE_REASONING_OPTIONS : modelReasoningOptions;
+}

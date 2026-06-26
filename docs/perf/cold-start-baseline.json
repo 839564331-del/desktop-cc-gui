@@ -1,0 +1,39 @@
+{
+  "schemaVersion": "1.0",
+  "generatedAt": "2026-06-18T11:01:56.178Z",
+  "source": "cold-start",
+  "metrics": [
+    {
+      "scenario": "S-CS-COLD",
+      "metric": "bundleSizeMain",
+      "value": 1071362,
+      "unit": "bytes-gzip",
+      "notes": "App-TXlavGAo.js"
+    },
+    {
+      "scenario": "S-CS-COLD",
+      "metric": "bundleSizeVendor",
+      "value": 741551,
+      "unit": "bytes-gzip",
+      "notes": "subset-shared.chunk-BRs1PAVC.js"
+    },
+    {
+      "scenario": "S-CS-COLD",
+      "metric": "firstPaintMs",
+      "value": null,
+      "unit": "ms",
+      "unsupportedReason": "Tauri/webview startup marker snapshot was not provided; bundle baseline is recorded."
+    },
+    {
+      "scenario": "S-CS-COLD",
+      "metric": "firstInteractiveMs",
+      "value": null,
+      "unit": "ms",
+      "unsupportedReason": "Tauri/webview startup marker snapshot was not provided; bundle baseline is recorded."
+    }
+  ],
+  "notes": [
+    "platform=darwin",
+    "startupMarkers=missing"
+  ]
+}

@@ -1,0 +1,593 @@
+import { useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from "react";
+import type { DebugEntry, ModelOption, WorkspaceInfo } from "../../../types";
+import { getConfigModel, getModelList } from "../../../services/tauri";
+import { CODEX_MODEL_CATALOG } from "../codexModelCatalog";
+import {
+  STORAGE_KEYS as PROVIDER_STORAGE_KEYS,
+  validateCodexCustomModels,
+} from "../../composer/types/provider";
+import {
+  STORAGE_KEYS,
+  getModelMapping,
+  applyModelMapping as applyMappingToDisplayName,
+} from "../constants";
+import { startupOrchestrator } from "../../startup-orchestration/utils/startupOrchestrator";
+
+type UseModelsOptions = {
+  activeWorkspace: WorkspaceInfo | null;
+  onDebug?: (entry: DebugEntry) => void;
+  preferredModelId?: string | null;
+  preferredEffort?: string | null;
+  preferredSelectionReady?: boolean;
+};
+
+type UseModelsResult = {
+  models: ModelOption[];
+  modelsReady: boolean;
+  selectedModel: ModelOption | null;
+  reasoningSupported: boolean;
+  selectedModelId: string | null;
+  setSelectedModelId: (next: string | null) => void;
+  reasoningOptions: string[];
+  selectedEffort: string | null;
+  setSelectedEffort: (next: string | null) => void;
+  refreshModels: () => Promise<void>;
+  globalSelectionReady: boolean;
+};
+
+type ModelRefreshPhase = "active-workspace" | "idle-prewarm" | "on-demand";
+
+const CONFIG_MODEL_DESCRIPTION = "Configured in CODEX_HOME/config.toml";
+
+const createModelOption = (
+  id: string,
+  displayName: string,
+  description = "",
+  source = "unknown",
+  supportedReasoningEfforts: ModelOption["supportedReasoningEfforts"] = [],
+  defaultReasoningEffort: string | null = null,
+): ModelOption => ({
+  id,
+  model: id,
+  displayName,
+  description,
+  source,
+  supportedReasoningEfforts,
+  defaultReasoningEffort,
+  isDefault: false,
+});
+
+const normalizeModelIdentity = (model: ModelOption): string => {
+  const modelId = model.model.trim().toLowerCase();
+  if (modelId.length > 0) {
+    return modelId;
+  }
+  return model.id.trim().toLowerCase();
+};
+
+const mergeModelOption = (existing: ModelOption, next: ModelOption): ModelOption => ({
+  ...existing,
+  id: next.id || existing.id,
+  model: next.model || existing.model,
+  displayName: next.displayName || existing.displayName,
+  description: next.description || existing.description,
+  source: next.source || existing.source,
+  supportedReasoningEfforts:
+    existing.supportedReasoningEfforts.length > 0
+      ? existing.supportedReasoningEfforts
+      : next.supportedReasoningEfforts,
+  defaultReasoningEffort:
+    existing.defaultReasoningEffort ?? next.defaultReasoningEffort,
+});
+
+const upsertModelOption = (
+  mergedModels: ModelOption[],
+  seenIdentities: Map<string, number>,
+  model: ModelOption,
+  replaceExisting = false,
+) => {
+  const identity = normalizeModelIdentity(model);
+  if (identity.length === 0) {
+    return;
+  }
+  const existingIndex = seenIdentities.get(identity);
+  if (existingIndex === undefined) {
+    seenIdentities.set(identity, mergedModels.length);
+    mergedModels.push(model);
+    return;
+  }
+  if (replaceExisting) {
+    mergedModels[existingIndex] = mergeModelOption(mergedModels[existingIndex], model);
+  }
+};
+
+const readCustomCodexModelOptions = (): ModelOption[] => {
+  if (typeof window === "undefined" || !window.localStorage) {
+    return [];
+  }
+  try {
+    const stored = window.localStorage.getItem(PROVIDER_STORAGE_KEYS.CODEX_CUSTOM_MODELS);
+    if (!stored) {
+      return [];
+    }
+    return validateCodexCustomModels(JSON.parse(stored)).map((model) =>
+      createModelOption(model.id, model.label, model.description ?? "", "custom"),
+    );
+  } catch {
+    return [];
+  }
+};
+
+const getBuiltInCodexModelOptions = (): ModelOption[] =>
+  CODEX_MODEL_CATALOG.map((model) =>
+    createModelOption(
+      model.id,
+      model.label,
+      model.description,
+      "catalog",
+      model.supportedReasoningEfforts ?? [],
+      normalizeEffort(model.defaultReasoningEffort),
+    ),
+  );
+
+const mergeCodexSelectableModels = (baseModels: ModelOption[]): ModelOption[] => {
+  const mergedModels: ModelOption[] = [];
+  const seenIdentities = new Map<string, number>();
+
+  baseModels.forEach((model) => upsertModelOption(mergedModels, seenIdentities, model));
+  readCustomCodexModelOptions().forEach((model) =>
+    upsertModelOption(mergedModels, seenIdentities, model, true),
+  );
+  getBuiltInCodexModelOptions().forEach((model) =>
+    upsertModelOption(mergedModels, seenIdentities, model, true),
+  );
+
+  return mergedModels;
+};
+
+const normalizeEffort = (value: unknown): string | null => {
+  if (typeof value !== "string") {
+    return null;
+  }
+  const trimmed = value.trim();
+  return trimmed.length > 0 ? trimmed : null;
+};
+
+const findModelByIdOrModel = (
+  models: ModelOption[],
+  idOrModel: string | null,
+): ModelOption | null => {
+  if (!idOrModel) {
+    return null;
+  }
+  return (
+    models.find((model) => model.id === idOrModel) ??
+    models.find((model) => model.model === idOrModel) ??
+    null
+  );
+};
+
+const pickDefaultModel = (models: ModelOption[], configModel: string | null) =>
+  findModelByIdOrModel(models, configModel) ??
+  models.find((model) => model.isDefault) ??
+  models[0] ??
+  null;
+
+export function useModels({
+  activeWorkspace,
+  onDebug,
+  preferredModelId = null,
+  preferredEffort = null,
+  preferredSelectionReady = true,
+}: UseModelsOptions): UseModelsResult {
+  const [rawModels, setRawModels] = useState<ModelOption[]>([]);
+  const [configModel, setConfigModel] = useState<string | null>(null);
+  const [selectedModelId, setSelectedModelIdState] = useState<string | null>(null);
+  const [selectedEffort, setSelectedEffortState] = useState<string | null>(null);
+  const [modelMappingVersion, setModelMappingVersion] = useState(0);
+  const lastCatalogAttemptWorkspaceId = useRef<string | null>(null);
+  const inFlightWorkspaceId = useRef<string | null>(null);
+  const latestRefreshRequestId = useRef(0);
+  const hasUserSelectedModel = useRef(false);
+  const hasUserSelectedEffort = useRef(false);
+  const lastWorkspaceId = useRef<string | null>(null);
+  const [catalogReadyForWorkspace, setCatalogReadyForWorkspace] = useState(false);
+
+  const workspaceId = activeWorkspace?.id ?? null;
+  const isConnected = Boolean(activeWorkspace?.connected);
+  const activeWorkspaceIdRef = useRef<string | null>(workspaceId);
+  activeWorkspaceIdRef.current = workspaceId;
+  const models = useMemo(() => {
+    void modelMappingVersion;
+    const mapping = getModelMapping();
+    const mappedModels = rawModels.map((model) => ({
+      ...model,
+      displayName: applyMappingToDisplayName(model.displayName, model.id, mapping),
+    }));
+    return mergeCodexSelectableModels(mappedModels);
+  }, [rawModels, modelMappingVersion]);
+
+  // Listen for localStorage changes (cross-tab sync + custom events)
+  useEffect(() => {
+    const isRelevantStorageKey = (key: string | null | undefined) =>
+      key === STORAGE_KEYS.CLAUDE_MODEL_MAPPING ||
+      key === PROVIDER_STORAGE_KEYS.CODEX_CUSTOM_MODELS;
+
+    const handleStorageChange = (e: StorageEvent) => {
+      if (isRelevantStorageKey(e.key)) {
+        setModelMappingVersion((v) => v + 1);
+      }
+    };
+
+    const handleCustomStorageChange = (e: Event) => {
+      const customEvent = e as CustomEvent<{ key: string }>;
+      if (isRelevantStorageKey(customEvent.detail?.key)) {
+        setModelMappingVersion((v) => v + 1);
+      }
+    };
+
+    window.addEventListener("storage", handleStorageChange);
+    window.addEventListener("localStorageChange", handleCustomStorageChange);
+
+    // Initial read of model mapping in case it was set before we started listening
+    const initialMapping = getModelMapping();
+    const hasMapping = Object.keys(initialMapping).length > 0;
+    const hasCustomCodexModels = readCustomCodexModelOptions().length > 0;
+    if (hasMapping || hasCustomCodexModels) {
+      // Trigger a re-apply of model mapping
+      setModelMappingVersion((v) => v + 1);
+    }
+
+    return () => {
+      window.removeEventListener("storage", handleStorageChange);
+      window.removeEventListener("localStorageChange", handleCustomStorageChange);
+    };
+  }, []);
+
+  useLayoutEffect(() => {
+    if (workspaceId === lastWorkspaceId.current) {
+      return;
+    }
+    hasUserSelectedModel.current = false;
+    hasUserSelectedEffort.current = false;
+    lastWorkspaceId.current = workspaceId;
+    lastCatalogAttemptWorkspaceId.current = null;
+    setConfigModel(null);
+    setRawModels([]);
+    setSelectedModelIdState(null);
+    setSelectedEffortState(null);
+    setCatalogReadyForWorkspace(false);
+  }, [workspaceId]);
+
+  useEffect(() => {
+    if (selectedEffort === null) {
+      return;
+    }
+    if (selectedEffort.trim().length > 0) {
+      return;
+    }
+    hasUserSelectedEffort.current = false;
+    setSelectedEffortState(null);
+  }, [selectedEffort]);
+
+  const setSelectedModelId = useCallback((next: string | null) => {
+    hasUserSelectedModel.current = true;
+    setSelectedModelIdState(next);
+  }, []);
+
+  const setSelectedEffort = useCallback((next: string | null) => {
+    hasUserSelectedEffort.current = true;
+    setSelectedEffortState(next);
+  }, []);
+
+  const selectedModel = useMemo(
+    () => models.find((model) => model.id === selectedModelId) ?? null,
+    [models, selectedModelId],
+  );
+
+  const reasoningSupported = useMemo(() => {
+    if (!selectedModel) {
+      return false;
+    }
+    return (
+      selectedModel.supportedReasoningEfforts.length > 0 ||
+      selectedModel.defaultReasoningEffort !== null
+    );
+  }, [selectedModel]);
+
+  const reasoningOptions = useMemo(() => {
+    const supported = selectedModel?.supportedReasoningEfforts.map(
+      (effort) => effort.reasoningEffort,
+    );
+    if (supported && supported.length > 0) {
+      return supported;
+    }
+    const defaultEffort = normalizeEffort(selectedModel?.defaultReasoningEffort);
+    return defaultEffort ? [defaultEffort] : [];
+  }, [selectedModel]);
+
+  const resolveEffort = useCallback(
+    (model: ModelOption, preferCurrent: boolean) => {
+      const supportedEfforts = model.supportedReasoningEfforts.map(
+        (effort) => effort.reasoningEffort,
+      );
+      const currentEffort = normalizeEffort(selectedEffort);
+      if (preferCurrent && currentEffort) {
+        return currentEffort;
+      }
+      if (supportedEfforts.length === 0) {
+        return normalizeEffort(preferredEffort);
+      }
+      const preferred = normalizeEffort(preferredEffort);
+      if (preferred && supportedEfforts.includes(preferred)) {
+        return preferred;
+      }
+      return normalizeEffort(model.defaultReasoningEffort);
+    },
+    [preferredEffort, selectedEffort],
+  );
+
+  const refreshModels = useCallback(async (phase: ModelRefreshPhase = "on-demand") => {
+    if (!workspaceId || !isConnected) {
+      return;
+    }
+    if (inFlightWorkspaceId.current === workspaceId) {
+      return;
+    }
+    inFlightWorkspaceId.current = workspaceId;
+    const refreshRequestId = latestRefreshRequestId.current + 1;
+    latestRefreshRequestId.current = refreshRequestId;
+    const requestedWorkspaceId = workspaceId;
+    onDebug?.({
+      id: `${Date.now()}-client-model-list`,
+      timestamp: Date.now(),
+      source: "client",
+      label: "model/list",
+      payload: { workspaceId },
+    });
+    try {
+      type ModelCatalogResult = [
+        PromiseSettledResult<Awaited<ReturnType<typeof getModelList>> | null>,
+        PromiseSettledResult<Awaited<ReturnType<typeof getConfigModel>>>,
+      ];
+      const [modelListResult, configModelResult] =
+        await startupOrchestrator.run<ModelCatalogResult>({
+          id: `model-catalog:${workspaceId}`,
+          phase,
+          priority: phase === "on-demand" ? 85 : 35,
+          dedupeKey: `model-catalog:${workspaceId}`,
+          concurrencyKey: "model-catalog",
+          timeoutMs: 8_000,
+          workspaceScope: { workspaceId },
+          cancelPolicy: "soft-ignore",
+          traceLabel: "model/list",
+          commandLabel: "model_list",
+          run: () =>
+            Promise.allSettled([
+              getModelList(workspaceId),
+              getConfigModel(workspaceId),
+            ]),
+          fallback: () =>
+            [
+              { status: "fulfilled", value: null },
+              { status: "fulfilled", value: null },
+            ] satisfies ModelCatalogResult,
+        });
+      const configModelFromConfig =
+        configModelResult.status === "fulfilled"
+          ? configModelResult.value
+          : null;
+      if (configModelResult.status === "rejected") {
+        onDebug?.({
+          id: `${Date.now()}-client-config-model-error`,
+          timestamp: Date.now(),
+          source: "error",
+          label: "config/model error",
+          payload:
+            configModelResult.reason instanceof Error
+              ? configModelResult.reason.message
+              : String(configModelResult.reason),
+        });
+      }
+      const response =
+        modelListResult.status === "fulfilled" ? modelListResult.value : null;
+      if (modelListResult.status === "rejected") {
+        onDebug?.({
+          id: `${Date.now()}-client-model-list-error`,
+          timestamp: Date.now(),
+          source: "error",
+          label: "model/list error",
+          payload:
+            modelListResult.reason instanceof Error
+              ? modelListResult.reason.message
+              : String(modelListResult.reason),
+        });
+      }
+      onDebug?.({
+        id: `${Date.now()}-server-model-list`,
+        timestamp: Date.now(),
+        source: "server",
+        label: "model/list response",
+        payload: response,
+      });
+      const isStaleResponse =
+        latestRefreshRequestId.current !== refreshRequestId ||
+        activeWorkspaceIdRef.current !== requestedWorkspaceId;
+      if (isStaleResponse) {
+        return;
+      }
+      setConfigModel(configModelFromConfig);
+      const rawData = response?.result?.data ?? response?.data ?? [];
+      const dataFromServer: ModelOption[] = rawData.map((item: any) => ({
+        id: String(item.id ?? item.model ?? ""),
+        model: String(item.model ?? item.id ?? ""),
+        displayName: String(item.displayName ?? item.display_name ?? item.model ?? ""),
+        description: String(item.description ?? ""),
+        source: String(item.source ?? "unknown"),
+        supportedReasoningEfforts: Array.isArray(item.supportedReasoningEfforts)
+          ? item.supportedReasoningEfforts
+          : Array.isArray(item.supported_reasoning_efforts)
+            ? item.supported_reasoning_efforts.map((effort: any) => ({
+                reasoningEffort: String(
+                  effort.reasoningEffort ?? effort.reasoning_effort ?? "",
+                ),
+                description: String(effort.description ?? ""),
+              }))
+            : [],
+        defaultReasoningEffort: normalizeEffort(
+          item.defaultReasoningEffort ?? item.default_reasoning_effort,
+        ),
+        isDefault: Boolean(item.isDefault ?? item.is_default ?? false),
+      }));
+      const data = (() => {
+        if (!configModelFromConfig) {
+          return dataFromServer;
+        }
+        const hasConfigModel = dataFromServer.some(
+          (model) => model.model === configModelFromConfig,
+        );
+        if (hasConfigModel) {
+          return dataFromServer;
+        }
+        const configOption: ModelOption = {
+          id: configModelFromConfig,
+          model: configModelFromConfig,
+          displayName: `${configModelFromConfig} (config)`,
+          description: CONFIG_MODEL_DESCRIPTION,
+          source: "settings-override",
+          supportedReasoningEfforts: [],
+          defaultReasoningEffort: null,
+          isDefault: false,
+        };
+        return [configOption, ...dataFromServer];
+      })();
+      const selectableData = mergeCodexSelectableModels(data);
+      setRawModels(data);
+      lastCatalogAttemptWorkspaceId.current = requestedWorkspaceId;
+      setCatalogReadyForWorkspace(
+        modelListResult.status === "fulfilled" && Array.isArray(rawData),
+      );
+      if (!preferredSelectionReady && !hasUserSelectedModel.current) {
+        return;
+      }
+      const defaultModel = pickDefaultModel(selectableData, configModelFromConfig);
+      const existingSelection = findModelByIdOrModel(selectableData, selectedModelId);
+      if (selectedModelId && !existingSelection) {
+        hasUserSelectedModel.current = false;
+      }
+      const preferredSelection = findModelByIdOrModel(selectableData, preferredModelId);
+      const shouldKeepExisting =
+        hasUserSelectedModel.current && existingSelection !== null;
+      const nextSelection =
+        (shouldKeepExisting ? existingSelection : null) ??
+        preferredSelection ??
+        defaultModel ??
+        existingSelection;
+      if (nextSelection) {
+        if (nextSelection.id !== selectedModelId) {
+          setSelectedModelIdState(nextSelection.id);
+        }
+        const nextEffort = resolveEffort(
+          nextSelection,
+          hasUserSelectedEffort.current,
+        );
+        if (nextEffort !== selectedEffort) {
+          setSelectedEffortState(nextEffort);
+        }
+      }
+    } finally {
+      if (inFlightWorkspaceId.current === requestedWorkspaceId) {
+        inFlightWorkspaceId.current = null;
+      }
+    }
+  }, [
+    isConnected,
+    onDebug,
+    preferredModelId,
+    preferredSelectionReady,
+    selectedEffort,
+    selectedModelId,
+    resolveEffort,
+    workspaceId,
+  ]);
+
+  useEffect(() => {
+    if (!workspaceId || !isConnected) {
+      return;
+    }
+    if (lastCatalogAttemptWorkspaceId.current === workspaceId) {
+      return;
+    }
+    refreshModels("active-workspace");
+  }, [isConnected, refreshModels, workspaceId]);
+
+  useEffect(() => {
+    if (!selectedModel) {
+      return;
+    }
+    const currentEffort = normalizeEffort(selectedEffort);
+    if (currentEffort) {
+      return;
+    }
+    const nextEffort = normalizeEffort(selectedModel.defaultReasoningEffort);
+    if (nextEffort === null) {
+      return;
+    }
+    hasUserSelectedEffort.current = false;
+    setSelectedEffortState(nextEffort);
+  }, [selectedEffort, selectedModel]);
+
+  useLayoutEffect(() => {
+    if (!models.length) {
+      return;
+    }
+    if (!preferredSelectionReady && !hasUserSelectedModel.current) {
+      return;
+    }
+    const preferredSelection = findModelByIdOrModel(models, preferredModelId);
+    const defaultModel = pickDefaultModel(models, configModel);
+    const existingSelection = findModelByIdOrModel(models, selectedModelId);
+    if (selectedModelId && !existingSelection) {
+      hasUserSelectedModel.current = false;
+    }
+    const shouldKeepUserSelection =
+      hasUserSelectedModel.current && existingSelection !== null;
+    if (shouldKeepUserSelection) {
+      return;
+    }
+    const nextSelection =
+      preferredSelection ?? defaultModel ?? existingSelection ?? null;
+    if (!nextSelection) {
+      return;
+    }
+    if (nextSelection.id !== selectedModelId) {
+      setSelectedModelIdState(nextSelection.id);
+    }
+    const nextEffort = resolveEffort(nextSelection, hasUserSelectedEffort.current);
+    if (nextEffort !== selectedEffort) {
+      setSelectedEffortState(nextEffort);
+    }
+  }, [
+    configModel,
+    models,
+    preferredModelId,
+    preferredSelectionReady,
+    selectedEffort,
+    selectedModelId,
+    resolveEffort,
+  ]);
+
+  return {
+    models,
+    modelsReady: catalogReadyForWorkspace,
+    selectedModel,
+    reasoningSupported,
+    selectedModelId,
+    setSelectedModelId,
+    reasoningOptions,
+    selectedEffort,
+    setSelectedEffort,
+    refreshModels,
+    globalSelectionReady: preferredSelectionReady && catalogReadyForWorkspace,
+  };
+}

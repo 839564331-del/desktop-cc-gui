@@ -1,0 +1,1403 @@
+// @vitest-environment jsdom
+import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { afterEach, beforeAll, beforeEach, describe, expect, it, vi } from "vitest";
+import type { ConversationItem } from "../../../types";
+import {
+  OPEN_TASK_RUN_EVENT,
+  readOpenTaskRunEvent,
+} from "../../agent-orchestration/utils/navigationEvents";
+import type { TaskRunRecord } from "../../tasks/types";
+import { Messages } from "./Messages";
+
+function makeRun(overrides: Partial<TaskRunRecord> = {}): TaskRunRecord {
+  return {
+    runId: "run-1",
+    task: {
+      taskId: "task-1",
+      source: "kanban",
+      workspaceId: "ws-1",
+      title: "Ship linked run",
+    },
+    engine: "codex",
+    status: "running",
+    trigger: "manual",
+    linkedThreadId: "thread-1",
+    currentStep: "Rendering linked run",
+    latestOutputSummary: "Linked run output",
+    blockedReason: null,
+    failureReason: null,
+    artifacts: [],
+    availableRecoveryActions: ["open_conversation"],
+    updatedAt: 20,
+    ...overrides,
+  };
+}
+
+describe("Messages", () => {
+  afterEach(() => {
+    cleanup();
+  });
+
+  beforeEach(() => {
+    window.localStorage.setItem("ccgui.claude.hideReasoningModule", "0");
+    window.localStorage.removeItem("ccgui.messages.live.autoFollow");
+    window.localStorage.removeItem("ccgui.messages.live.collapseMiddleSteps");
+  });
+
+  beforeAll(() => {
+    if (!HTMLElement.prototype.scrollIntoView) {
+      HTMLElement.prototype.scrollIntoView = vi.fn();
+    }
+    if (!HTMLElement.prototype.scrollTo) {
+      HTMLElement.prototype.scrollTo = vi.fn();
+    }
+  });
+
+  it("keeps Claude reasoning title stable while streaming", () => {
+    window.localStorage.removeItem("ccgui.claude.hideReasoningModule");
+
+    const items: ConversationItem[] = [
+      {
+        id: "msg-user-streaming",
+        kind: "message",
+        role: "user",
+        text: "继续分析",
+      },
+      {
+        id: "reasoning-streaming",
+        kind: "reasoning",
+        summary: "检查日志模块",
+        content: "先核对 Controller，再核对 Service。",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="claude:session-streaming"
+        workspaceId="ws-1"
+        isThinking={true}
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(screen.getByText("messages.thinkingLabel")).toBeTruthy();
+    expect(screen.queryByText("messages.thinkingProcess")).toBeNull();
+  });
+
+  it("renders the linked TaskRun indicator for the active thread and opens run detail", () => {
+    const openedRunIds: string[] = [];
+    const handleOpenTaskRun = (event: Event) => {
+      const runId = readOpenTaskRunEvent(event);
+      if (runId) {
+        openedRunIds.push(runId);
+      }
+    };
+    window.addEventListener(OPEN_TASK_RUN_EVENT, handleOpenTaskRun);
+
+    try {
+      render(
+        <Messages
+          items={[]}
+          threadId="thread-1"
+          workspaceId="ws-1"
+          isThinking={false}
+          activeEngine="codex"
+          openTargets={[]}
+          selectedOpenAppId=""
+          taskRuns={[
+            makeRun(),
+            makeRun({
+              runId: "run-other",
+              linkedThreadId: "thread-other",
+              task: {
+                taskId: "task-other",
+                source: "kanban",
+                workspaceId: "ws-1",
+                title: "Other run",
+              },
+            }),
+          ]}
+        />,
+      );
+
+      expect(screen.getByText("Ship linked run")).toBeTruthy();
+      expect(screen.getByText(/Linked run output/)).toBeTruthy();
+      expect(screen.queryByText("Other run")).toBeNull();
+
+      fireEvent.click(screen.getByText("messages.openLinkedRun"));
+
+      expect(openedRunIds).toEqual(["run-1"]);
+    } finally {
+      window.removeEventListener(OPEN_TASK_RUN_EVENT, handleOpenTaskRun);
+    }
+  });
+
+  it("keeps legacy Claude docked reasoning mode when the flag is explicitly enabled", () => {
+    window.localStorage.setItem("ccgui.claude.hideReasoningModule", "1");
+
+    const items: ConversationItem[] = [
+      {
+        id: "msg-user-docked",
+        kind: "message",
+        role: "user",
+        text: "先分析",
+      },
+      {
+        id: "reasoning-docked",
+        kind: "reasoning",
+        summary: "思考",
+        content: "先检查 Controller 和 Service。",
+      },
+      {
+        id: "msg-assistant-docked",
+        kind: "message",
+        role: "assistant",
+        text: "我已经分析完了。",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-claude-docked"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const reasoningBlock = container.querySelector(".thinking-block");
+    const assistantMessage = container.querySelector(".message.assistant");
+    expect(reasoningBlock).toBeTruthy();
+    expect(assistantMessage).toBeTruthy();
+    if (!reasoningBlock || !assistantMessage) {
+      throw new Error("expected reasoning block and assistant message");
+    }
+    expect(
+      assistantMessage.compareDocumentPosition(reasoningBlock) &
+        Node.DOCUMENT_POSITION_FOLLOWING,
+    ).toBeTruthy();
+  });
+
+  it("renders assistant tail copy actions with fork and rewind only on final replies", async () => {
+    const handleForkFromMessage = vi.fn();
+    const handleRewindFromMessage = vi.fn();
+    const writeTextMock = vi.fn(async () => undefined);
+    Object.defineProperty(navigator, "clipboard", {
+      value: { writeText: writeTextMock },
+      configurable: true,
+    });
+    const items: ConversationItem[] = [
+      {
+        id: "user-tail-actions-1",
+        kind: "message",
+        role: "user",
+        text: "first request",
+      },
+      {
+        id: "assistant-tail-actions-1-part-1",
+        kind: "message",
+        role: "assistant",
+        text: "first answer part 1",
+      },
+      {
+        id: "assistant-tail-actions-1",
+        kind: "message",
+        role: "assistant",
+        text: "first answer part 2",
+        isFinal: true,
+      },
+      {
+        id: "user-tail-actions-2",
+        kind: "message",
+        role: "user",
+        text: "second request",
+      },
+      {
+        id: "assistant-tail-actions-2",
+        kind: "message",
+        role: "assistant",
+        text: "second answer",
+        isFinal: true,
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="codex:tail-actions"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+        onForkFromMessage={handleForkFromMessage}
+        onRewindFromMessage={handleRewindFromMessage}
+      />,
+    );
+
+    expect(container.querySelector(".messages-final-boundary .message-action-bar")).toBeNull();
+    expect(
+      container.querySelectorAll(".message-tail-action-row .message-action-bar-row"),
+    ).toHaveLength(2);
+    const tailActionRows = container.querySelectorAll(".message-tail-action-row");
+    expect(tailActionRows[0].querySelectorAll("button")).toHaveLength(1);
+    expect(tailActionRows[1].querySelectorAll("button")).toHaveLength(3);
+    expect(screen.getAllByRole("button", { name: "messages.copyMessage" })).toHaveLength(4);
+    const assistantCopyButtons = container.querySelectorAll(
+      ".message-tail-action-row .message-copy-button",
+    );
+    expect(assistantCopyButtons).toHaveLength(2);
+    await act(async () => {
+      fireEvent.click(assistantCopyButtons[0]);
+    });
+    expect(writeTextMock).toHaveBeenCalledWith("first answer part 1\n\nfirst answer part 2");
+    const forkButtons = screen.getAllByRole("button", { name: "messages.forkMessage" });
+    expect(forkButtons).toHaveLength(1);
+    expect(forkButtons[0].querySelector(".codicon-git-branch-create")).toBeTruthy();
+    fireEvent.click(forkButtons[0]);
+    expect(handleForkFromMessage).toHaveBeenCalledWith("user-tail-actions-2");
+
+    const rewindButtons = screen.getAllByRole("button", { name: "messages.rewindMessage" });
+    expect(rewindButtons).toHaveLength(1);
+    expect(rewindButtons[0].querySelector(".codicon-history")).toBeTruthy();
+    fireEvent.click(rewindButtons[0]);
+    expect(handleRewindFromMessage).toHaveBeenCalledWith("user-tail-actions-2");
+  });
+
+  it("does not backfill historical user message badge from active mode", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-no-mode-1",
+        kind: "message",
+        role: "user",
+        text: "这条消息本身没有模式元数据",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+        activeCollaborationModeId="plan"
+      />,
+    );
+
+    expect(container.querySelector(".message-mode-badge")).toBeNull();
+  });
+
+  it("does not show collaboration badge for non-codex engines", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "msg-claude-1",
+        kind: "message",
+        role: "user",
+        text:
+          "Collaboration mode: code. Do not ask the user follow-up questions.\n\nUser request: 你好",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+        activeEngine="claude"
+        activeCollaborationModeId="code"
+      />,
+    );
+
+    expect(container.querySelector(".message-mode-badge")).toBeNull();
+    expect(container.textContent ?? "").toContain(
+      "Collaboration mode: code. Do not ask the user follow-up questions.",
+    );
+  });
+
+  it("enhances lead keywords only on codex assistant markdown", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-lead-1",
+        kind: "message",
+        role: "assistant",
+        text: "PLAN\n\n执行内容",
+      },
+    ];
+
+    const { container, rerender } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".markdown-lead-paragraph")).toBeTruthy();
+      expect(container.querySelector(".markdown-codex-canvas")).toBeTruthy();
+    });
+
+    rerender(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelector(".markdown-lead-paragraph")).toBeNull();
+  });
+
+  it("applies codex markdown visual style through presentation profile", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-profile-1",
+        kind: "message",
+        role: "assistant",
+        text: "PLAN\n\n执行内容",
+      },
+    ];
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="claude"
+        presentationProfile={{
+          engine: "codex",
+          preferCommandSummary: true,
+          codexCanvasMarkdown: true,
+          showReasoningLiveDot: true,
+          heartbeatWaitingHint: false,
+          assistantMarkdownStreamingThrottleMs: 80,
+          reasoningStreamingThrottleMs: 180,
+          useCodexStagedMarkdownThrottle: true,
+        }}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelector(".markdown-codex-canvas")).toBeTruthy();
+  });
+
+  it("hides TodoWrite tool blocks from chat stream", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "tool-read-1",
+        kind: "tool",
+        toolType: "toolCall",
+        title: "Tool: read",
+        detail: JSON.stringify({ file_path: "src/keep-a.ts" }),
+        status: "completed",
+        output: "content",
+      },
+      {
+        id: "tool-todo-1",
+        kind: "tool",
+        toolType: "toolCall",
+        title: "Tool: TodoWrite",
+        detail: JSON.stringify({ todos: [{ content: "step1" }] }),
+        status: "completed",
+        output: "todo updated",
+      },
+      {
+        id: "tool-edit-1",
+        kind: "tool",
+        toolType: "toolCall",
+        title: "Tool: edit",
+        detail: JSON.stringify({
+          file_path: "src/keep-b.ts",
+          old_string: "a",
+          new_string: "b",
+        }),
+        status: "completed",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(screen.getByText("keep-a.ts")).toBeTruthy();
+    expect(screen.getByText("keep-b.ts")).toBeTruthy();
+    expect(screen.queryByText("待办列表")).toBeNull();
+  });
+
+  it("collapses duplicate reasoning snapshots separated only by hidden TodoWrite tools", () => {
+    const repeated =
+      "用户要求进行项目分析，这是一个比较宽泛的请求。我需要先读取项目规范并查看项目结构。";
+    const items: ConversationItem[] = [
+      {
+        id: "reasoning-hidden-sep-1",
+        kind: "reasoning",
+        summary: repeated,
+        content: repeated,
+      },
+      {
+        id: "tool-hidden-todo-1",
+        kind: "tool",
+        toolType: "toolCall",
+        title: "Tool: TodoWrite",
+        detail: JSON.stringify({ todos: [{ content: "step 1" }] }),
+        status: "completed",
+        output: "todo updated",
+      },
+      {
+        id: "reasoning-hidden-sep-2",
+        kind: "reasoning",
+        summary: `${repeated} 现在我继续读取 README.md。`,
+        content: `${repeated} 现在我继续读取 README.md。`,
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelectorAll(".thinking-block").length).toBe(1);
+    expect(container.textContent ?? "").toContain("现在我继续读取 README.md");
+  });
+
+  it("matches extended lead keywords with semantic icons", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-lead-next-1",
+        kind: "message",
+        role: "assistant",
+        text: "下一步建议\n\n继续补齐验收。",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    await waitFor(() => {
+      expect(container.querySelector(".markdown-lead-next")).toBeTruthy();
+      expect(container.querySelector(".markdown-lead-icon")?.textContent ?? "").toContain("🚀");
+    });
+  });
+
+  it("collapses pathological fragmented paragraphs in assistant markdown", () => {
+    const fragmented = [
+      "湘宁大兄弟",
+      "你好！",
+      "这段记录",
+      "说",
+      "的是：",
+      "记",
+      "录内容分",
+      "析",
+      "这是一个**",
+      "对",
+      "话开场片",
+      "段**",
+    ].join("\n\n");
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-fragmented-1",
+        kind: "message",
+        role: "assistant",
+        text: `这段记录看起来是：\n\n${fragmented}\n\n总结完毕。`,
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const paragraphs = container.querySelectorAll(".markdown p");
+    expect(paragraphs.length).toBeGreaterThanOrEqual(1);
+    expect(paragraphs.length).toBeLessThanOrEqual(3);
+    const markdownText = container.querySelector(".markdown")?.textContent ?? "";
+    expect(markdownText).toContain("湘宁大兄弟你好！");
+    expect(markdownText).toContain("这段记录说的是：");
+    expect(markdownText).toContain("这是一个对话开场片段");
+  });
+
+  it("collapses pathological fragmented blockquote paragraphs in assistant markdown", () => {
+    const fragmentedQuote = [
+      "湘宁大兄弟",
+      "你好！",
+      "这段记录",
+      "说",
+      "的是：",
+      "记",
+      "录内容分",
+      "析",
+      "这是一个**",
+      "对",
+      "话开场片",
+      "段**",
+    ]
+      .map((line) => `> ${line}`)
+      .join("\n\n");
+
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-fragmented-quote-1",
+        kind: "message",
+        role: "assistant",
+        text: `这段记录看起来是：\n\n${fragmentedQuote}\n\n总结完毕。`,
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const quoteParagraphs = container.querySelectorAll(".markdown blockquote p");
+    expect(quoteParagraphs.length).toBeGreaterThanOrEqual(1);
+    expect(quoteParagraphs.length).toBeLessThanOrEqual(3);
+    const markdownText = container.querySelector(".markdown")?.textContent ?? "";
+    expect(markdownText).toContain("湘宁大兄弟你好！");
+    expect(markdownText).toContain("这段记录说的是：");
+    expect(markdownText).toContain("这是一个对话开场片段");
+  });
+
+  it("collapses fragmented paragraphs when blank lines contain spaces", () => {
+    const fragmented = [
+      "你好",
+      "！",
+      "有什么",
+      "我可以",
+      "帮",
+      "你的",
+      "吗",
+      "？",
+    ].join("\n \n");
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-fragmented-spaces-1",
+        kind: "message",
+        role: "assistant",
+        text: `先回应：\n \n${fragmented}`,
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const markdownText = container.querySelector(".markdown")?.textContent ?? "";
+    expect(markdownText).toContain("你好！有什么我可以帮你的吗？");
+  });
+
+  it("collapses single-line fragmented cjk runs in assistant markdown", () => {
+    const fragmented = [
+      "你",
+      "好",
+      "！",
+      "我",
+      "是",
+      "你",
+      "的",
+      "AI",
+      "联",
+      "合",
+      "架",
+      "构",
+      "师",
+      "。",
+    ].join("\n");
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-single-line-fragmented-1",
+        kind: "message",
+        role: "assistant",
+        text: fragmented,
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="claude"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const markdownText = container.querySelector(".markdown")?.textContent ?? "";
+    expect(markdownText).toContain("你好！我是你的AI联合架构师。");
+  });
+
+  it("renders memory context summary as a separate collapsible card", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "memory-summary-1",
+        kind: "message",
+        role: "assistant",
+        text: "【记忆上下文摘要】\n[对话记录] 第一条；[项目上下文] 第二条",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelector(".memory-context-summary-card")).toBeTruthy();
+    expect(container.querySelector(".message.assistant .bubble")).toBeNull();
+    expect(container.querySelector(".markdown")).toBeNull();
+    const toggle = container.querySelector(".memory-context-summary-toggle");
+    expect(toggle).toBeTruthy();
+    if (!toggle) {
+      return;
+    }
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      const content = container.querySelector(".memory-context-summary-content");
+      expect(content?.textContent ?? "").toContain("第一条");
+      expect(content?.textContent ?? "").toContain("第二条");
+    });
+  });
+
+  it("renders legacy user-injected memory prefix as summary card and keeps user input text", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "legacy-user-memory-1",
+        kind: "message",
+        role: "user",
+        text:
+          "[对话记录] 用户输入：你知道苹果手机吗。 我刚买了一个16pro 助手输出摘要：知道的！ iPhone 16 Pro 是苹果 2024 年发布的旗舰机型。 助手输出：知道的！\n\n我的手机是什么牌子的",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelector(".memory-context-summary-card")).toBeTruthy();
+    const bubble = container.querySelector(".message.user .bubble");
+    const memoryCard = container.querySelector(".memory-context-summary-card");
+    expect(bubble).toBeTruthy();
+    expect(memoryCard).toBeTruthy();
+    expect(bubble?.contains(memoryCard)).toBe(false);
+    const userText = container.querySelector(".user-collapsible-text-content");
+    expect(userText?.textContent ?? "").toBe("我的手机是什么牌子的");
+    expect(userText?.textContent ?? "").not.toContain("用户输入：你知道苹果手机吗");
+    const toggle = container.querySelector(".memory-context-summary-toggle");
+    expect(toggle).toBeTruthy();
+    if (!toggle) {
+      return;
+    }
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      const content = container.querySelector(".memory-context-summary-content");
+      expect(content?.textContent ?? "").toContain("[对话记录]");
+      expect(content?.textContent ?? "").toContain("助手输出摘要");
+    });
+  });
+
+  it("renders codex memory-scout references as standalone context resources", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "codex-user-memory-scout-1",
+        kind: "message",
+        role: "user",
+        text: [
+          '<project-memory source="memory-scout" count="1" status="ok" truncated="false">',
+          "Memory Brief:",
+          "1. [conversation_turn] 项目分析 (memoryId=m-1)",
+          "   reason: Matched query terms: 项目",
+          "   summary: 历史对话里已经分析过这个项目",
+          "   source: threadId=t-1 turnId=turn-1 engine=codex updatedAt=1",
+          "</project-memory>",
+          "",
+          "以前做过项目分析吗",
+        ].join("\n"),
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-memory-scout"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const bubble = container.querySelector(".message.user .bubble");
+    const memoryCard = container.querySelector(".memory-context-summary-card");
+    expect(memoryCard).toBeTruthy();
+    expect(bubble).toBeTruthy();
+    expect(bubble?.contains(memoryCard)).toBe(false);
+    expect(container.querySelector(".user-collapsible-text-content")?.textContent ?? "").toBe(
+      "以前做过项目分析吗",
+    );
+    expect(bubble?.textContent ?? "").not.toContain("Memory Brief");
+
+    const toggle = container.querySelector(".memory-context-summary-toggle");
+    expect(toggle).toBeTruthy();
+    if (!toggle) {
+      return;
+    }
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      const content = container.querySelector(".memory-context-summary-content");
+      expect(content?.textContent ?? "").toContain("项目分析");
+      expect(content?.textContent ?? "").toContain("engine=codex");
+    });
+  });
+
+  it("renders retrieval pack references with stable memory indexes outside the user bubble", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "codex-user-memory-pack-1",
+        kind: "message",
+        role: "user",
+        text: [
+          '<project-memory-pack source="memory-scout" count="1" cleaned="true" cleanerStatus="cleaned" truncated="false">',
+          "Cleaned Context:",
+          "- [M1] 项目使用 Spring Boot 2.7 + Java 11。",
+          "",
+          "Conflicts:",
+          "- none",
+          "",
+          "Irrelevant Records:",
+          "- none",
+          "",
+          "Source Records:",
+          "[M1] memoryId=m-pack-1 title=项目技术栈 recordKind=conversation_turn sourceType=conversation_turn threadId=t-1 turnId=turn-1 engine=codex updatedAt=1",
+          "Original user input:",
+          "项目技术栈是什么",
+          "Original assistant response:",
+          "项目使用 Spring Boot 2.7 + Java 11。",
+          "",
+          "Instruction:",
+          "Use relevant records as prior project context.",
+          "</project-memory-pack>",
+          "",
+          "继续分析项目",
+        ].join("\n"),
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-memory-pack"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const bubble = container.querySelector(".message.user .bubble");
+    const memoryCard = container.querySelector(".memory-context-summary-card");
+    expect(memoryCard).toBeTruthy();
+    expect(bubble).toBeTruthy();
+    expect(bubble?.contains(memoryCard)).toBe(false);
+    expect(container.querySelector(".user-collapsible-text-content")?.textContent ?? "").toBe(
+      "继续分析项目",
+    );
+    expect(bubble?.textContent ?? "").not.toContain("project-memory-pack");
+
+    const toggle = container.querySelector(".memory-context-summary-toggle");
+    expect(toggle).toBeTruthy();
+    if (!toggle) {
+      return;
+    }
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      const content = container.querySelector(".memory-context-summary-content");
+      expect(content?.querySelector(".memory-context-summary-record")).toBeTruthy();
+      expect(content?.querySelector(".memory-context-summary-record-index")?.textContent).toBe(
+        "#1",
+      );
+      expect(content?.textContent ?? "").toContain("项目技术栈");
+      expect(content?.textContent ?? "").not.toContain("Spring Boot");
+      expect(content?.textContent ?? "").not.toContain("Original user input");
+    });
+  });
+
+  it("uses unique display indexes for multiple memory packs and exposes the real sent payload", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "codex-user-memory-pack-detail-1",
+        kind: "message",
+        role: "user",
+        text: [
+          '<project-memory-pack source="manual-selection" count="1" cleaned="false" cleanerStatus="source_records_only" truncated="false">',
+          "Cleaned Context:",
+          "- source records only",
+          "",
+          "Source Records:",
+          "[M1] memoryId=m-manual-1 title=手动选择记忆 recordKind=conversation_turn sourceType=conversation_turn threadId=t-1 turnId=turn-1 engine=codex updatedAt=1",
+          "Original user input:",
+          "手动记忆问题",
+          "Original assistant response:",
+          "手动记忆回答",
+          "",
+          "Instruction:",
+          "Use relevant records as prior project context.",
+          "</project-memory-pack>",
+          "",
+          '<project-memory-pack source="memory-scout" count="1" cleaned="true" cleanerStatus="cleaned" truncated="false">',
+          "Cleaned Context:",
+          "### 自动记忆摘要",
+          "",
+          "- **重点**：自动引用事实",
+          "",
+          "Source Records:",
+          "[M1] memoryId=m-scout-1 title=自动引用记忆 recordKind=conversation_turn sourceType=conversation_turn threadId=t-2 turnId=turn-2 engine=codex updatedAt=2",
+          "Original user input:",
+          "自动记忆问题",
+          "Original assistant response:",
+          "自动记忆回答",
+          "",
+          "Instruction:",
+          "Use relevant records as prior project context.",
+          "</project-memory-pack>",
+          "",
+          "继续分析",
+        ].join("\n"),
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-memory-pack-detail"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const toggle = container.querySelector(".memory-context-summary-toggle");
+    expect(toggle).toBeTruthy();
+    if (!toggle) {
+      return;
+    }
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(
+        [...container.querySelectorAll(".memory-context-summary-record-index")].map(
+          (node) => node.textContent,
+        ),
+      ).toEqual(["#1", "#2"]);
+      const cardText = container.querySelector(".memory-context-summary-content")?.textContent ?? "";
+      expect(cardText).toContain("手动选择记忆");
+      expect(cardText).toContain("自动引用记忆");
+      expect(cardText).not.toContain("手动记忆问题");
+      expect(cardText).not.toContain("自动记忆问题");
+    });
+
+    const detailButton = container.querySelector(".memory-context-summary-detail-button");
+    expect(detailButton).toBeTruthy();
+    if (!detailButton) {
+      return;
+    }
+    fireEvent.click(detailButton);
+    await waitFor(() => {
+      const dialog = document.body.querySelector(".memory-context-payload-dialog");
+      expect(dialog?.querySelector(".memory-context-payload-dialog-close")?.textContent).toBe(
+        "×",
+      );
+      expect(
+        dialog?.querySelector(".memory-context-payload-markdown h3")?.textContent,
+      ).toBe("自动记忆摘要");
+      expect(dialog?.querySelector(".memory-context-payload-markdown strong")?.textContent).toBe(
+        "重点",
+      );
+      expect(dialog?.textContent ?? "").toContain(
+        '<project-memory-pack source="manual-selection"',
+      );
+      expect(dialog?.textContent ?? "").toContain(
+        '<project-memory-pack source="memory-scout"',
+      );
+      expect(dialog?.textContent ?? "").toContain("[M1] memoryId=m-manual-1");
+      expect(dialog?.textContent ?? "").toContain("[M1] memoryId=m-scout-1");
+      expect(dialog?.textContent ?? "").toContain("Original user input:");
+    });
+  });
+
+  it("formats legacy markdown memory summaries inside the normalized context card", async () => {
+    const items: ConversationItem[] = [
+      {
+        id: "memory-summary-markdown-1",
+        kind: "message",
+        role: "assistant",
+        text: [
+          "【记忆上下文摘要】",
+          "### 项目约束",
+          "",
+          "- 必须保留 Markdown 列表",
+          "- `Memory Reference` 只展示一张卡",
+        ].join("\n"),
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-memory-markdown"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const toggle = container.querySelector(".memory-context-summary-toggle");
+    expect(toggle).toBeTruthy();
+    if (!toggle) {
+      return;
+    }
+    fireEvent.click(toggle);
+    await waitFor(() => {
+      expect(container.querySelector(".memory-context-summary-markdown h3")?.textContent).toBe(
+        "项目约束",
+      );
+      expect(container.querySelectorAll(".memory-context-summary-markdown li")).toHaveLength(2);
+      expect(container.querySelector(".memory-context-summary-markdown code")?.textContent).toBe(
+        "Memory Reference",
+      );
+    });
+  });
+
+  it("dedupes assistant memory summary cards against attributed user memory wrapper in the same turn", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-memory-summary-1",
+        kind: "message",
+        role: "assistant",
+        text: "【记忆上下文摘要】\n[对话记录] 第一条；[项目上下文] 第二条...",
+      },
+      {
+        id: "real-user-memory-1",
+        kind: "message",
+        role: "user",
+        text: [
+          '<project-memory source="manual-selection" count="3" truncated="true">',
+          "[对话记录] 第一条",
+          "[项目上下文] 第二条",
+          "[已知问题] 第三条",
+          "</project-memory>",
+          "",
+          "请基于这些记忆继续分析",
+        ].join("\n"),
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-memory-dedupe"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelectorAll(".memory-context-summary-card")).toHaveLength(1);
+    const userText = container.querySelector(".user-collapsible-text-content");
+    expect(userText?.textContent ?? "").toBe("请基于这些记忆继续分析");
+    expect(container.textContent ?? "").not.toContain("[对话记录] 第一条");
+  });
+
+  it("does not leak project-memory xml when a same-turn assistant summary suppresses a memory-only user row", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "assistant-memory-summary-only",
+        kind: "message",
+        role: "assistant",
+        text: "【记忆上下文摘要】\n[对话记录] 第一条；[项目上下文] 第二条",
+      },
+      {
+        id: "real-user-memory-only",
+        kind: "message",
+        role: "user",
+        text: [
+          '<project-memory source="manual-selection" count="2" truncated="false">',
+          "[对话记录] 第一条",
+          "[项目上下文] 第二条",
+          "</project-memory>",
+          "",
+        ].join("\n"),
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-memory-only-dedupe"
+        workspaceId="ws-1"
+        isThinking={false}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelectorAll(".memory-context-summary-card")).toHaveLength(1);
+    expect(container.querySelector(".message.user .bubble")).toBeNull();
+    expect(container.textContent ?? "").not.toContain("<project-memory");
+  });
+
+  it("shows collapsible user input toggle when content overflows and expands on click", () => {
+    const originalScrollHeight = Object.getOwnPropertyDescriptor(
+      HTMLElement.prototype,
+      "scrollHeight",
+    );
+    Object.defineProperty(HTMLElement.prototype, "scrollHeight", {
+      configurable: true,
+      get() {
+        return this.classList.contains("user-collapsible-content") ? 280 : 0;
+      },
+    });
+
+    try {
+      const items: ConversationItem[] = [
+        {
+          id: "user-collapse-1",
+          kind: "message",
+          role: "user",
+          text: Array.from({ length: 24 }, (_, index) => `Line ${index + 1}`).join("\n"),
+        },
+      ];
+
+      const { container } = render(
+        <Messages
+          items={items}
+          threadId="thread-1"
+          workspaceId="ws-1"
+          isThinking={false}
+          openTargets={[]}
+          selectedOpenAppId=""
+        />,
+      );
+
+      const toggle = container.querySelector(".user-collapsible-toggle") as HTMLButtonElement | null;
+      const content = container.querySelector(".user-collapsible-content") as HTMLDivElement | null;
+      expect(toggle).toBeTruthy();
+      expect(content).toBeTruthy();
+      expect(content?.style.maxHeight).toBe("160px");
+
+      if (toggle) {
+        fireEvent.click(toggle);
+      }
+
+      expect(toggle?.getAttribute("aria-expanded")).toBe("true");
+      expect(content?.style.maxHeight).toBe("none");
+    } finally {
+      if (originalScrollHeight) {
+        Object.defineProperty(HTMLElement.prototype, "scrollHeight", originalScrollHeight);
+      } else {
+        delete (HTMLElement.prototype as { scrollHeight?: number }).scrollHeight;
+      }
+    }
+  });
+
+  it("renders user-only anchors and scrolls on click", () => {
+    const scrollToMock = vi.fn();
+    HTMLElement.prototype.scrollTo = scrollToMock;
+
+    const items: ConversationItem[] = [
+      {
+        id: "anchor-u1",
+        kind: "message",
+        role: "user",
+        text: "first",
+      },
+      {
+        id: "anchor-a1",
+        kind: "message",
+        role: "assistant",
+        text: "second",
+      },
+      {
+        id: "anchor-u2",
+        kind: "message",
+        role: "user",
+        text: "third",
+      },
+    ];
+
+    render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const rail = screen.getByRole("navigation", { name: "messages.anchorNavigation" });
+    expect(rail).toBeTruthy();
+    const anchorButtons = screen.getAllByRole("button", {
+      name: "messages.anchorJumpToUser",
+    });
+    expect(anchorButtons.length).toBe(2);
+    const firstAnchorButton = anchorButtons[0];
+    if (!firstAnchorButton) {
+      throw new Error("Anchor button not found");
+    }
+    fireEvent.click(firstAnchorButton);
+    expect(scrollToMock).toHaveBeenCalledWith(
+      expect.objectContaining({ behavior: "smooth" }),
+    );
+  });
+
+  it("collapses earlier items and reveals them on demand", () => {
+    const items: ConversationItem[] = Array.from({ length: 32 }, (_, index) => ({
+      id: `history-item-${index + 1}`,
+      kind: "message",
+      role: index % 2 === 0 ? "user" : "assistant",
+      text: `history message ${index + 1}`,
+    }));
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-history-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(screen.queryByText("history message 1")).toBeNull();
+    expect(screen.getByText("history message 3")).toBeTruthy();
+    expect(screen.getByText("history message 17")).toBeTruthy();
+
+    const indicator = container.querySelector(".messages-collapsed-indicator");
+    expect(indicator).toBeTruthy();
+    expect(indicator?.getAttribute("data-collapsed-count")).toBe("2");
+    if (!indicator) {
+      return;
+    }
+    fireEvent.click(indicator);
+
+    expect(screen.getByText("history message 1")).toBeTruthy();
+    expect(container.querySelector(".messages-collapsed-indicator")).toBeNull();
+  });
+
+  it("resets collapsed state when conversation head changes", () => {
+    const firstBatch: ConversationItem[] = Array.from({ length: 32 }, (_, index) => ({
+      id: `session-a-${index + 1}`,
+      kind: "message",
+      role: index % 2 === 0 ? "user" : "assistant",
+      text: `session A message ${index + 1}`,
+    }));
+    const secondBatch: ConversationItem[] = Array.from({ length: 32 }, (_, index) => ({
+      id: `session-b-${index + 1}`,
+      kind: "message",
+      role: index % 2 === 0 ? "user" : "assistant",
+      text: `session B message ${index + 1}`,
+    }));
+
+    const { container, rerender } = render(
+      <Messages
+        items={firstBatch}
+        threadId="thread-history-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const firstIndicator = container.querySelector(".messages-collapsed-indicator");
+    expect(firstIndicator).toBeTruthy();
+    if (firstIndicator) {
+      fireEvent.click(firstIndicator);
+    }
+    expect(screen.getByText("session A message 1")).toBeTruthy();
+
+    rerender(
+      <Messages
+        items={secondBatch}
+        threadId="thread-history-1"
+        workspaceId="ws-1"
+        isThinking={false}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(screen.queryByText("session B message 1")).toBeNull();
+    const secondIndicator = container.querySelector(".messages-collapsed-indicator");
+    expect(secondIndicator).toBeTruthy();
+    expect(secondIndicator?.getAttribute("data-collapsed-count")).toBe("2");
+  });
+
+  it("uses reasoning title for the working indicator and keeps title-only reasoning rows visible", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "reasoning-1",
+        kind: "reasoning",
+        summary: "Scanning repository",
+        content: "",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking
+        processingStartedAt={Date.now() - 1_000}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const workingText = container.querySelector(".working-text");
+    expect(workingText?.textContent ?? "").toContain("Scanning repository");
+    expect(container.querySelector(".thinking-block")).toBeTruthy();
+    expect(container.querySelector(".thinking-title")).toBeTruthy();
+  });
+
+  it("shows title-only reasoning rows in codex canvas for real-time visibility", () => {
+    const items: ConversationItem[] = [
+      {
+        id: "reasoning-codex-live-1",
+        kind: "reasoning",
+        summary: "Scanning repository",
+        content: "",
+      },
+    ];
+
+    const { container } = render(
+      <Messages
+        items={items}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking
+        processingStartedAt={Date.now() - 1_000}
+        activeEngine="codex"
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    expect(container.querySelector(".thinking-block")).toBeTruthy();
+    expect(container.querySelector(".thinking-title")).toBeTruthy();
+  });
+
+  it("shows a prominent proxy badge in the working indicator when proxy is enabled", () => {
+    const { container } = render(
+      <Messages
+        items={[]}
+        threadId="thread-1"
+        workspaceId="ws-1"
+        isThinking
+        proxyEnabled
+        proxyUrl="http://127.0.0.1:7890"
+        processingStartedAt={Date.now() - 1_000}
+        openTargets={[]}
+        selectedOpenAppId=""
+      />,
+    );
+
+    const badge = container.querySelector(".working .working-proxy-badge");
+    expect(badge).toBeTruthy();
+    expect(badge?.textContent ?? "").toBe("");
+    expect(badge?.classList.contains("proxy-status-badge--animated")).toBe(true);
+    expect(badge?.getAttribute("aria-label") ?? "").toContain("127.0.0.1:7890");
+  });
+
+});

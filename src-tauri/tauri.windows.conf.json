@@ -1,0 +1,13 @@
+{
+  "app": {
+    "windows": []
+  },
+  "bundle": {
+    "createUpdaterArtifacts": false,
+    "windows": {
+      "webviewInstallMode": {
+        "type": "offlineInstaller"
+      }
+    }
+  }
+}

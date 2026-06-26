@@ -1,0 +1,2309 @@
+//! Claude Code engine implementation
+//!
+//! Handles Claude Code CLI execution via `claude -p` (print mode) with
+//! streaming JSON output.
+
+use serde_json::{json, Value};
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
+use std::sync::Mutex as StdMutex;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::process::{Child, Command};
+use tokio::sync::{broadcast, Mutex, Notify, RwLock};
+#[cfg(unix)]
+use tokio::time::sleep;
+
+use super::claude_message_content::{build_message_content, format_ask_user_answer};
+use super::events::EngineEvent;
+use super::{EngineConfig, EngineType, SendMessageParams};
+
+pub(crate) type ClaudeAskUserQuestionResumeDiagnosticSink =
+    Arc<dyn Fn(ClaudeAskUserQuestionResumeDiagnostic) + Send + Sync>;
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeAskUserQuestionResumeDiagnostic {
+    pub(crate) workspace_id: String,
+    pub(crate) thread_id: Option<String>,
+    pub(crate) turn_id: String,
+    pub(crate) request_id: Option<String>,
+    pub(crate) succeeded: bool,
+    pub(crate) error: Option<String>,
+}
+#[path = "claude/approval.rs"]
+mod approval;
+#[path = "claude/event_conversion.rs"]
+mod event_conversion;
+mod lifecycle;
+#[path = "claude/manager.rs"]
+mod manager;
+#[path = "claude_stream_helpers.rs"]
+mod stream_helpers;
+mod user_input;
+use approval::{
+    classify_claude_mode_blocked_tool, command_can_apply_as_local_file_action,
+    extract_claude_command_string, looks_like_claude_permission_denial_message,
+    ClaudeModeBlockedKind, SyntheticApprovalSummaryEntry,
+};
+#[cfg(test)]
+use approval::{
+    format_synthetic_approval_completion_text, format_synthetic_approval_resume_message,
+    SYNTHETIC_APPROVAL_RESUME_MARKER_PREFIX,
+};
+#[cfg(test)]
+#[path = "claude/tests_stream.rs"]
+mod tests_stream;
+pub use manager::ClaudeSessionManager;
+#[cfg(test)]
+use stream_helpers::extract_text_from_content;
+#[cfg(test)]
+use stream_helpers::extract_tool_result_text;
+use stream_helpers::{
+    extract_claude_tool_input, extract_claude_tool_name, extract_result_text, extract_string_field,
+    is_claude_stream_control_line, looks_like_claude_runtime_error, merge_text_chunks,
+    parse_claude_stream_json_line, tool_input_signature,
+};
+
+impl Drop for ClaudeSession {
+    fn drop(&mut self) {
+        let Ok(mut active) = self.active_processes.try_lock() else {
+            log::warn!(
+                "[claude] dropping session workspace={} while active_processes is locked; child cleanup fallback skipped",
+                self.workspace_id
+            );
+            return;
+        };
+        if active.is_empty() {
+            return;
+        }
+        for (turn_id, mut child) in active.drain() {
+            let pid = child.id();
+            match child.start_kill() {
+                Ok(()) => {
+                    log::info!(
+                        "[claude] drop fallback started child kill workspace={} turn={} pid={:?}",
+                        self.workspace_id,
+                        turn_id,
+                        pid
+                    );
+                }
+                Err(error) => {
+                    log::warn!(
+                        "[claude] drop fallback failed to kill child workspace={} turn={} pid={:?}: {}",
+                        self.workspace_id,
+                        turn_id,
+                        pid,
+                        error
+                    );
+                }
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ClaudeTurnEvent {
+    pub turn_id: String,
+    pub event: EngineEvent,
+    pub stream_timing: Option<ClaudeStreamTiming>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct ClaudeStreamTiming {
+    pub(crate) stdout_received_at_ms: Option<u64>,
+    pub(crate) process_spawn_started_at_ms: Option<u64>,
+    pub(crate) process_spawned_at_ms: Option<u64>,
+    pub(crate) stdin_write_started_at_ms: Option<u64>,
+    pub(crate) stdin_closed_at_ms: Option<u64>,
+    pub(crate) turn_started_at_ms: Option<u64>,
+    pub(crate) first_stdout_line_at_ms: Option<u64>,
+    pub(crate) first_valid_stream_event_at_ms: Option<u64>,
+    pub(crate) first_text_delta_at_ms: Option<u64>,
+    pub(crate) session_emitted_at_ms: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ClaudeStreamStartupTiming {
+    process_spawn_started_at_ms: Option<u64>,
+    process_spawned_at_ms: Option<u64>,
+    stdin_write_started_at_ms: Option<u64>,
+    stdin_closed_at_ms: Option<u64>,
+    turn_started_at_ms: Option<u64>,
+    first_stdout_line_at_ms: Option<u64>,
+    first_valid_stream_event_at_ms: Option<u64>,
+    first_text_delta_at_ms: Option<u64>,
+}
+
+impl ClaudeStreamStartupTiming {
+    fn to_stream_timing(
+        &self,
+        stdout_received_at_ms: Option<u64>,
+        session_emitted_at_ms: u64,
+    ) -> ClaudeStreamTiming {
+        ClaudeStreamTiming {
+            stdout_received_at_ms,
+            process_spawn_started_at_ms: self.process_spawn_started_at_ms,
+            process_spawned_at_ms: self.process_spawned_at_ms,
+            stdin_write_started_at_ms: self.stdin_write_started_at_ms,
+            stdin_closed_at_ms: self.stdin_closed_at_ms,
+            turn_started_at_ms: self.turn_started_at_ms,
+            first_stdout_line_at_ms: self.first_stdout_line_at_ms,
+            first_valid_stream_event_at_ms: self.first_valid_stream_event_at_ms,
+            first_text_delta_at_ms: self.first_text_delta_at_ms,
+            session_emitted_at_ms,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct PendingClaudeTool {
+    turn_id: String,
+    tool_id: String,
+    tool_name: String,
+    input_signature: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingClaudeToolSummary {
+    tool_id: String,
+    tool_name: String,
+}
+
+const RETRYABLE_PROMPT_TOO_LONG_PREFIX: &str = "__claude_retryable_prompt_too_long__:";
+const AUTO_COMPACT_SIGNAL_SOURCE: &str = "auto_compact_retry";
+const CLAUDE_TEXT_DELTA_COALESCE_WINDOW_MS: u64 = 32;
+const CLAUDE_NON_INTERACTIVE_ENV: &str = "CLAUDE_NON_INTERACTIVE";
+const CLAUDE_CONTEXT_COMMAND_PROBE_COOLDOWN: Duration = Duration::from_secs(120);
+const CLAUDE_CONTEXT_COMMAND_SHORT_PROMPT_MAX_CHARS: usize = 80;
+#[cfg(not(test))]
+const CLAUDE_STREAM_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(90);
+#[cfg(test)]
+const CLAUDE_STREAM_FIRST_EVENT_TIMEOUT: Duration = Duration::from_secs(10);
+const CLAUDE_STREAM_DIAGNOSTIC_SAMPLE_LIMIT: usize = 800;
+const CLAUDE_REASONING_EFFORTS: &[&str] = &["low", "medium", "high", "xhigh", "max"];
+
+#[derive(Debug, Default)]
+struct BufferedClaudeTextDelta {
+    text: String,
+    started_at: Option<Instant>,
+    first_stdout_received_at_ms: Option<u64>,
+    stream_startup_timing: Option<ClaudeStreamStartupTiming>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ClaudeContextCommandProbeDecision {
+    Run,
+    SkipLiveTelemetry,
+    SkipShortPrompt,
+    SkipCooldown,
+}
+
+impl BufferedClaudeTextDelta {
+    #[cfg(test)]
+    fn push(&mut self, delta: &str) {
+        self.push_with_timing(delta, None);
+    }
+
+    fn push_with_timing(&mut self, delta: &str, stdout_received_at_ms: Option<u64>) {
+        if delta.is_empty() {
+            return;
+        }
+        if self.started_at.is_none() {
+            self.started_at = Some(Instant::now());
+        }
+        if self.first_stdout_received_at_ms.is_none() {
+            self.first_stdout_received_at_ms = stdout_received_at_ms;
+        }
+        self.text.push_str(delta);
+    }
+
+    fn set_stream_startup_timing(&mut self, timing: &ClaudeStreamStartupTiming) {
+        if self.stream_startup_timing.is_none() {
+            self.stream_startup_timing = Some(timing.clone());
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.text.is_empty()
+    }
+
+    fn has_expired(&self, window: Duration) -> bool {
+        self.started_at
+            .map(|started_at| started_at.elapsed() >= window)
+            .unwrap_or(false)
+    }
+
+    fn remaining_window(&self, window: Duration) -> Option<Duration> {
+        let started_at = self.started_at?;
+        window.checked_sub(started_at.elapsed())
+    }
+
+    #[cfg(test)]
+    fn take(&mut self) -> Option<String> {
+        self.take_with_timing().map(|emission| emission.text)
+    }
+
+    fn take_with_timing(&mut self) -> Option<BufferedClaudeTextDeltaEmission> {
+        if self.text.is_empty() {
+            self.started_at = None;
+            self.first_stdout_received_at_ms = None;
+            return None;
+        }
+        self.started_at = None;
+        Some(BufferedClaudeTextDeltaEmission {
+            text: std::mem::take(&mut self.text),
+            stdout_received_at_ms: self.first_stdout_received_at_ms.take(),
+            stream_startup_timing: self.stream_startup_timing.take(),
+        })
+    }
+}
+
+#[derive(Debug)]
+struct BufferedClaudeTextDeltaEmission {
+    text: String,
+    stdout_received_at_ms: Option<u64>,
+    stream_startup_timing: Option<ClaudeStreamStartupTiming>,
+}
+
+fn unix_timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+/// Claude Code session for a workspace
+pub struct ClaudeSession {
+    /// Workspace identifier
+    pub workspace_id: String,
+    /// Workspace directory path
+    pub workspace_path: PathBuf,
+    /// Current Claude session ID (for --resume)
+    session_id: RwLock<Option<String>>,
+    /// Event broadcaster
+    event_sender: broadcast::Sender<ClaudeTurnEvent>,
+    /// Custom binary path
+    bin_path: Option<String>,
+    /// Custom home directory
+    home_dir: Option<String>,
+    /// Additional CLI arguments
+    custom_args: Option<String>,
+    /// Active child processes by turn ID (supports concurrent turns)
+    active_processes: Mutex<HashMap<String, Child>>,
+    /// Flag set by interrupt() so send_message() knows the process was killed intentionally
+    interrupted: AtomicBool,
+    /// Disposal flag set when workspace/session is being torn down.
+    disposed: AtomicBool,
+    /// Track tool names for completion events
+    tool_name_by_id: StdMutex<HashMap<String, String>>,
+    /// Track tool input buffers for streaming input_json_delta
+    tool_input_by_id: StdMutex<HashMap<String, String>>,
+    /// Cache the latest structured tool input so completion events can reuse it
+    tool_input_value_by_id: StdMutex<HashMap<String, Value>>,
+    /// Map turn-scoped content block index to tool id
+    tool_id_by_block_index: StdMutex<HashMap<(String, i64), String>>,
+    /// Track unresolved tools so transcript-style tool_result payloads can be paired back
+    pending_tools: StdMutex<Vec<PendingClaudeTool>>,
+    /// Last emitted text for assistant partial messages, isolated per turn
+    last_emitted_text_by_turn: StdMutex<HashMap<String, String>>,
+    /// Turns that already received authoritative live context-window usage.
+    live_context_usage_turns: StdMutex<HashSet<String>>,
+    /// Last low-frequency `/context` probe reservation per Claude session id.
+    last_context_probe_by_session: StdMutex<HashMap<String, Instant>>,
+    /// Pending AskUserQuestion requests: request_id -> turn_id
+    pending_user_inputs: StdMutex<HashMap<String, String>>,
+    /// Pending synthetic Claude approval requests: request_id -> turn_id
+    pending_approval_requests: StdMutex<HashMap<String, String>>,
+    /// Synthetic approval summaries accumulated per turn for final completion reporting
+    synthetic_approval_summaries_by_turn:
+        StdMutex<HashMap<String, Vec<SyntheticApprovalSummaryEntry>>>,
+    /// Per-turn signal to resume stdout processing after approval responses arrive
+    approval_notify_by_turn: StdMutex<HashMap<String, Arc<Notify>>>,
+    /// Per-turn formatted approval resolution text for kill+resume mechanism
+    approval_resume_message_by_turn: StdMutex<HashMap<String, String>>,
+    /// Per-turn signal to resume stdout processing after AskUserQuestion response
+    user_input_notify_by_turn: StdMutex<HashMap<String, Arc<Notify>>>,
+    /// Per-turn formatted AskUserQuestion answer for kill+resume mechanism
+    user_input_answer_by_turn: StdMutex<HashMap<String, String>>,
+    /// Per-turn request id for AskUserQuestion resume diagnostics.
+    user_input_request_id_by_turn: StdMutex<HashMap<String, String>>,
+    /// Per-turn frontend thread id for runtime diagnostics.
+    thread_id_by_turn: StdMutex<HashMap<String, String>>,
+    /// AskUserQuestion resume attempts waiting for the resumed stream to produce a valid event.
+    pending_user_input_resume_diagnostic_by_turn: StdMutex<HashMap<String, Option<String>>>,
+    /// Optional observer for real AskUserQuestion resume success/failure.
+    ask_user_question_resume_diagnostic_sink:
+        StdMutex<Option<ClaudeAskUserQuestionResumeDiagnosticSink>>,
+}
+
+impl ClaudeSession {
+    fn is_invalid_fork_session_id(value: &str) -> bool {
+        value.is_empty()
+            || value == "."
+            || value.starts_with('-')
+            || value.contains('/')
+            || value.contains('\\')
+            || value.contains("..")
+            || !value
+                .chars()
+                .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+    }
+
+    fn normalized_fork_session_id(params: &SendMessageParams) -> Result<Option<String>, String> {
+        let Some(value) = params.fork_session_id.as_ref() else {
+            return Ok(None);
+        };
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return Err("forkSessionId is required for Claude fork session".to_string());
+        }
+        if Self::is_invalid_fork_session_id(trimmed) {
+            return Err("invalid forkSessionId for Claude fork session".to_string());
+        }
+        Ok(Some(trimmed.to_string()))
+    }
+
+    fn configure_spawn_command(cmd: &mut Command) {
+        #[cfg(unix)]
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setpgid(0, 0) == 0 {
+                    Ok(())
+                } else {
+                    Err(std::io::Error::last_os_error())
+                }
+            });
+        }
+    }
+
+    fn should_use_stream_json_input(params: &SendMessageParams) -> bool {
+        let has_images = params
+            .images
+            .as_ref()
+            .map_or(false, |imgs| imgs.iter().any(|s| !s.trim().is_empty()));
+        if has_images {
+            return true;
+        }
+        // Keep user prompt bytes out of argv. Windows .cmd/.bat wrappers run
+        // through cmd.exe, where shell metacharacters can corrupt argv prompts.
+        !params.text.trim().is_empty()
+    }
+
+    fn is_unknown_include_hook_events_error(error_output: &str) -> bool {
+        let normalized = error_output.to_ascii_lowercase();
+        normalized.contains("include-hook-events")
+            && (normalized.contains("unknown")
+                || normalized.contains("unrecognized")
+                || normalized.contains("unexpected")
+                || normalized.contains("invalid option")
+                || normalized.contains("not supported"))
+    }
+
+    fn push_stream_diagnostic_sample(sample: &mut String, text: &str) {
+        if sample.len() >= CLAUDE_STREAM_DIAGNOSTIC_SAMPLE_LIMIT {
+            return;
+        }
+        let remaining = CLAUDE_STREAM_DIAGNOSTIC_SAMPLE_LIMIT - sample.len();
+        if text.len() <= remaining {
+            sample.push_str(text);
+            return;
+        }
+
+        let mut end = 0;
+        for (index, _) in text.char_indices() {
+            if index > remaining {
+                break;
+            }
+            end = index;
+        }
+        if end == 0 {
+            return;
+        }
+        sample.push_str(&text[..end]);
+    }
+
+    fn build_stream_no_event_timeout_error(diagnostic_sample: &str) -> String {
+        let base = format!(
+            "Claude stream-json startup timed out after {}s without a valid stream event",
+            CLAUDE_STREAM_FIRST_EVENT_TIMEOUT.as_secs()
+        );
+        let sample = diagnostic_sample.trim();
+        if sample.is_empty() {
+            return format!("{base}. No stdout/stderr diagnostics were observed.");
+        }
+        format!("{base}. Diagnostic sample:\n{}", sample)
+    }
+
+    fn build_process_exit_error(
+        status: std::process::ExitStatus,
+        error_output: &str,
+        diagnostic_sample: &str,
+        use_stream_json_input: bool,
+        include_hook_events: bool,
+        access_mode: Option<&str>,
+    ) -> String {
+        let detail = error_output.trim();
+        if !detail.is_empty() {
+            return detail.to_string();
+        }
+
+        let sample = diagnostic_sample.trim();
+        let diagnostic_detail = if sample.is_empty() {
+            "No stdout/stderr diagnostics were observed.".to_string()
+        } else {
+            format!("Diagnostic sample:\n{sample}")
+        };
+
+        format!(
+            "Claude exited with status: {status}. Diagnostics: input_format={}, include_hook_events={}, permission_mode={}. {diagnostic_detail}",
+            if use_stream_json_input { "stream-json" } else { "argv" },
+            include_hook_events,
+            access_mode.unwrap_or("current"),
+        )
+    }
+
+    fn stream_diagnostic_sample_snapshot(sample: &Arc<StdMutex<String>>) -> String {
+        sample.lock().map(|value| value.clone()).unwrap_or_default()
+    }
+
+    fn is_valid_claude_stream_event(event: &Value) -> bool {
+        matches!(
+            event.get("type").and_then(|value| value.as_str()),
+            Some(
+                "stream_event"
+                    | "system"
+                    | "assistant"
+                    | "assistant_message_delta"
+                    | "message_delta"
+                    | "text_delta"
+                    | "output_text_delta"
+                    | "assistant_message"
+                    | "message"
+                    | "user"
+                    | "result"
+                    | "reasoning_delta"
+                    | "thinking_delta"
+                    | "error"
+                    | "tool_use"
+                    | "tool_result"
+            )
+        )
+    }
+
+    async fn fail_stream_no_event_timeout(
+        &self,
+        turn_id: &str,
+        diagnostic_sample: Arc<StdMutex<String>>,
+        mut stderr_handle: tokio::task::JoinHandle<String>,
+    ) -> Result<String, String> {
+        let mut child = {
+            let mut active = self.active_processes.lock().await;
+            active.remove(turn_id)
+        };
+        if let Some(mut child_proc) = child.take() {
+            if let Err(error) = self.terminate_child_process(turn_id, &mut child_proc).await {
+                log::warn!(
+                    "[claude] failed to terminate stream-timeout child for turn={}: {}",
+                    turn_id,
+                    error
+                );
+            }
+        }
+        tokio::select! {
+            _ = &mut stderr_handle => {}
+            _ = tokio::time::sleep(Duration::from_secs(2)) => {
+                stderr_handle.abort();
+            }
+        }
+        let error_msg = Self::build_stream_no_event_timeout_error(
+            &Self::stream_diagnostic_sample_snapshot(&diagnostic_sample),
+        );
+        self.emit_pending_ask_user_question_resume_failure(turn_id, &error_msg);
+        self.emit_turn_event(
+            turn_id,
+            EngineEvent::TurnError {
+                workspace_id: self.workspace_id.clone(),
+                error: error_msg.clone(),
+                code: Some("claude_stream_no_event_timeout".to_string()),
+            },
+        );
+        self.clear_turn_ephemeral_state(turn_id);
+        Err(error_msg)
+    }
+
+    fn emit_stream_no_valid_event_error(&self, turn_id: &str, diagnostic_sample: &str) -> String {
+        let error_msg = if diagnostic_sample.trim().is_empty() {
+            "Claude stream-json ended without a valid stream event.".to_string()
+        } else {
+            format!(
+                "Claude stream-json ended without a valid stream event. Diagnostic sample:\n{}",
+                diagnostic_sample.trim()
+            )
+        };
+        self.emit_turn_event(
+            turn_id,
+            EngineEvent::TurnError {
+                workspace_id: self.workspace_id.clone(),
+                error: error_msg.clone(),
+                code: Some("claude_stream_no_valid_event".to_string()),
+            },
+        );
+        error_msg
+    }
+
+    /// Create a new Claude session for tests.
+    #[cfg(test)]
+    pub fn new(
+        workspace_id: String,
+        workspace_path: PathBuf,
+        config: Option<EngineConfig>,
+    ) -> Self {
+        Self::new_with_runtime(workspace_id, workspace_path, config)
+    }
+
+    pub fn new_with_runtime(
+        workspace_id: String,
+        workspace_path: PathBuf,
+        config: Option<EngineConfig>,
+    ) -> Self {
+        let (event_sender, _) = broadcast::channel(1024);
+        let config = config.unwrap_or_default();
+
+        Self {
+            workspace_id,
+            workspace_path,
+            session_id: RwLock::new(None),
+            event_sender,
+            bin_path: config.bin_path,
+            home_dir: config.home_dir,
+            custom_args: config.custom_args,
+            active_processes: Mutex::new(HashMap::new()),
+            interrupted: AtomicBool::new(false),
+            disposed: AtomicBool::new(false),
+            tool_name_by_id: StdMutex::new(HashMap::new()),
+            tool_input_by_id: StdMutex::new(HashMap::new()),
+            tool_input_value_by_id: StdMutex::new(HashMap::new()),
+            tool_id_by_block_index: StdMutex::new(HashMap::new()),
+            pending_tools: StdMutex::new(Vec::new()),
+            last_emitted_text_by_turn: StdMutex::new(HashMap::new()),
+            live_context_usage_turns: StdMutex::new(HashSet::new()),
+            last_context_probe_by_session: StdMutex::new(HashMap::new()),
+            pending_user_inputs: StdMutex::new(HashMap::new()),
+            pending_approval_requests: StdMutex::new(HashMap::new()),
+            synthetic_approval_summaries_by_turn: StdMutex::new(HashMap::new()),
+            approval_notify_by_turn: StdMutex::new(HashMap::new()),
+            approval_resume_message_by_turn: StdMutex::new(HashMap::new()),
+            user_input_notify_by_turn: StdMutex::new(HashMap::new()),
+            user_input_answer_by_turn: StdMutex::new(HashMap::new()),
+            user_input_request_id_by_turn: StdMutex::new(HashMap::new()),
+            thread_id_by_turn: StdMutex::new(HashMap::new()),
+            pending_user_input_resume_diagnostic_by_turn: StdMutex::new(HashMap::new()),
+            ask_user_question_resume_diagnostic_sink: StdMutex::new(None),
+        }
+    }
+
+    pub(crate) fn register_turn_thread_id(&self, turn_id: &str, thread_id: &str) {
+        let normalized_thread_id = thread_id.trim();
+        if normalized_thread_id.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.thread_id_by_turn.lock() {
+            map.insert(turn_id.to_string(), normalized_thread_id.to_string());
+        }
+    }
+
+    pub(crate) fn set_ask_user_question_resume_diagnostic_sink(
+        &self,
+        sink: Option<ClaudeAskUserQuestionResumeDiagnosticSink>,
+    ) {
+        if let Ok(mut current) = self.ask_user_question_resume_diagnostic_sink.lock() {
+            *current = sink;
+        }
+    }
+
+    fn take_user_input_request_id_for_turn(&self, turn_id: &str) -> Option<String> {
+        self.user_input_request_id_by_turn
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(turn_id))
+    }
+
+    fn remember_pending_ask_user_question_resume_diagnostic(
+        &self,
+        turn_id: &str,
+        request_id: Option<String>,
+    ) {
+        if let Ok(mut map) = self.pending_user_input_resume_diagnostic_by_turn.lock() {
+            map.insert(turn_id.to_string(), request_id);
+        }
+    }
+
+    fn take_pending_ask_user_question_resume_diagnostic(
+        &self,
+        turn_id: &str,
+    ) -> Option<Option<String>> {
+        self.pending_user_input_resume_diagnostic_by_turn
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(turn_id))
+    }
+
+    fn emit_pending_ask_user_question_resume_success(&self, turn_id: &str) {
+        if let Some(request_id) = self.take_pending_ask_user_question_resume_diagnostic(turn_id) {
+            self.emit_ask_user_question_resume_diagnostic(turn_id, request_id, true, None);
+        }
+    }
+
+    fn emit_pending_ask_user_question_resume_failure(&self, turn_id: &str, error: &str) {
+        if let Some(request_id) = self.take_pending_ask_user_question_resume_diagnostic(turn_id) {
+            self.emit_ask_user_question_resume_diagnostic(
+                turn_id,
+                request_id,
+                false,
+                Some(error.to_string()),
+            );
+        }
+    }
+
+    fn emit_ask_user_question_resume_diagnostic(
+        &self,
+        turn_id: &str,
+        request_id: Option<String>,
+        succeeded: bool,
+        error: Option<String>,
+    ) {
+        let sink = self
+            .ask_user_question_resume_diagnostic_sink
+            .lock()
+            .ok()
+            .and_then(|current| current.clone());
+        let thread_id = self
+            .thread_id_by_turn
+            .lock()
+            .ok()
+            .and_then(|map| map.get(turn_id).cloned());
+        if let Some(sink) = sink {
+            sink(ClaudeAskUserQuestionResumeDiagnostic {
+                workspace_id: self.workspace_id.clone(),
+                thread_id,
+                turn_id: turn_id.to_string(),
+                request_id,
+                succeeded,
+                error,
+            });
+        }
+    }
+
+    /// Get a receiver for engine events
+    pub fn subscribe(&self) -> broadcast::Receiver<ClaudeTurnEvent> {
+        self.event_sender.subscribe()
+    }
+
+    /// Get current session ID
+    pub async fn get_session_id(&self) -> Option<String> {
+        self.session_id.read().await.clone()
+    }
+
+    pub async fn active_process_ids(&self) -> Vec<u32> {
+        let active = self.active_processes.lock().await;
+        active.values().filter_map(|child| child.id()).collect()
+    }
+
+    fn is_disposed(&self) -> bool {
+        self.disposed.load(Ordering::SeqCst)
+    }
+
+    pub(crate) fn mark_disposed(&self) {
+        self.disposed.store(true, Ordering::SeqCst);
+    }
+
+    /// Emit a TurnError event to notify the frontend when an error occurs
+    /// outside the normal send_message flow (e.g., spawn failure, early errors).
+    fn emit_turn_event(&self, turn_id: &str, event: EngineEvent) {
+        self.emit_turn_event_with_stream_timing(turn_id, event, None);
+    }
+
+    fn emit_turn_event_with_stream_timing(
+        &self,
+        turn_id: &str,
+        event: EngineEvent,
+        stream_timing: Option<ClaudeStreamTiming>,
+    ) {
+        let _ = self.event_sender.send(ClaudeTurnEvent {
+            turn_id: turn_id.to_string(),
+            event,
+            stream_timing,
+        });
+    }
+
+    fn flush_buffered_text_delta(
+        &self,
+        turn_id: &str,
+        pending_text_delta: &mut BufferedClaudeTextDelta,
+    ) {
+        let Some(emission) = pending_text_delta.take_with_timing() else {
+            return;
+        };
+        self.emit_turn_event_with_stream_timing(
+            turn_id,
+            EngineEvent::TextDelta {
+                workspace_id: self.workspace_id.clone(),
+                text: emission.text,
+            },
+            Some(
+                emission
+                    .stream_startup_timing
+                    .unwrap_or_default()
+                    .to_stream_timing(emission.stdout_received_at_ms, unix_timestamp_ms()),
+            ),
+        );
+    }
+
+    pub fn emit_error(&self, turn_id: &str, error: String) {
+        self.emit_turn_event(
+            turn_id,
+            EngineEvent::TurnError {
+                workspace_id: self.workspace_id.clone(),
+                error,
+                code: None,
+            },
+        );
+    }
+
+    async fn fail_send_setup_and_terminate_child(
+        &self,
+        turn_id: &str,
+        child: &mut Child,
+        error_msg: String,
+    ) -> Result<String, String> {
+        if let Err(error) = self.terminate_child_process(turn_id, child).await {
+            log::debug!(
+                "[claude] failed to terminate setup-failed child process (turn={}): {}",
+                turn_id,
+                error
+            );
+        }
+        self.clear_turn_ephemeral_state(turn_id);
+        Err(error_msg)
+    }
+
+    /// Set session ID (after successful execution)
+    pub async fn set_session_id(&self, id: Option<String>) {
+        *self.session_id.write().await = id;
+    }
+
+    fn resolve_cli_binary(&self) -> String {
+        if let Some(ref custom) = self.bin_path {
+            return custom.clone();
+        }
+        crate::backend::app_server::find_cli_binary("claude", None)
+            .map(|p| p.to_string_lossy().to_string())
+            .unwrap_or_else(|| "claude".to_string())
+    }
+
+    fn cli_binary_diagnostics(&self) -> (String, &'static str) {
+        let bin = self.resolve_cli_binary();
+        let wrapper_kind = crate::backend::app_server::wrapper_kind_for_binary(&bin);
+        (bin, wrapper_kind)
+    }
+
+    /// Build the Claude CLI command
+    fn build_command(
+        &self,
+        params: &SendMessageParams,
+        use_stream_json_input: bool,
+        include_hook_events: bool,
+    ) -> Command {
+        // Resolve the Claude CLI binary path:
+        // 1. Use custom bin_path if configured
+        // 2. Otherwise use find_cli_binary() to search npm global, cargo, etc.
+        // 3. Fall back to bare "claude" as last resort
+        let bin = self.resolve_cli_binary();
+
+        // Use build_command_for_binary to properly handle .cmd/.bat files on Windows
+        let mut cmd = crate::backend::app_server::build_command_for_binary(&bin);
+
+        // Set working directory
+        cmd.current_dir(&self.workspace_path);
+
+        // Print mode (non-interactive)
+        cmd.arg("-p");
+
+        if use_stream_json_input {
+            // Use stream-json input format for image payloads and multiline text.
+            // The actual content will be sent via stdin.
+            cmd.arg(""); // Empty string as placeholder, real content via stdin
+            cmd.arg("--input-format");
+            cmd.arg("stream-json");
+        } else {
+            // Compatibility fallback only. Production sends user prompts through
+            // stream-json stdin so shell wrappers never parse prompt text.
+            cmd.arg(&params.text);
+        }
+
+        // Output format for streaming
+        cmd.arg("--output-format");
+        cmd.arg("stream-json");
+
+        // Verbose for more events
+        cmd.arg("--verbose");
+
+        // Include partial messages for streaming text
+        cmd.arg("--include-partial-messages");
+
+        if include_hook_events {
+            cmd.arg("--include-hook-events");
+        }
+
+        // Access mode / permission handling
+        // Maps UI access modes to Claude Code CLI permission flags
+        match params.access_mode.as_deref() {
+            Some("full-access") => {
+                // Full access: bypass all permission checks
+                cmd.arg("--dangerously-skip-permissions");
+            }
+            Some("read-only") => {
+                // Read-only / Plan mode: only allow planning, no execution
+                cmd.arg("--permission-mode");
+                cmd.arg("plan");
+            }
+            Some("default") => {
+                // Default mode: each tool use requires explicit permission
+                cmd.arg("--permission-mode");
+                cmd.arg("default");
+            }
+            _ => {
+                // "current" mode: auto-accept edits but still prompt for dangerous ops
+                cmd.arg("--permission-mode");
+                cmd.arg("acceptEdits");
+            }
+        }
+
+        // Model selection
+        if let Some(ref model) = params.model {
+            cmd.arg("--model");
+            cmd.arg(model);
+        }
+
+        if let Some(effort) = params
+            .effort
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| CLAUDE_REASONING_EFFORTS.contains(value))
+        {
+            cmd.arg("--effort");
+            cmd.arg(effort);
+        }
+
+        // Session continuation / explicit session identity.
+        // Claude's native fork contract resumes a parent session and asks the
+        // CLI to allocate a new child session id.
+        match Self::normalized_fork_session_id(params) {
+            Ok(Some(fork_session_id)) => {
+                cmd.arg("--resume");
+                cmd.arg(fork_session_id);
+                cmd.arg("--fork-session");
+            }
+            Ok(None) => {
+                if params.continue_session {
+                    if let Some(ref session_id) = params.session_id {
+                        cmd.arg("--resume");
+                        cmd.arg(session_id);
+                    } else {
+                        cmd.arg("--continue");
+                    }
+                } else if let Some(ref session_id) = params.session_id {
+                    // Force a fresh, stable identity for "new conversation" runs.
+                    // This prevents concurrent Claude turns from collapsing into the
+                    // same persisted session due CLI implicit reuse behavior.
+                    cmd.arg("--session-id");
+                    cmd.arg(session_id);
+                }
+            }
+            Err(_) => {}
+        }
+
+        if let Some(spec_root) = params
+            .custom_spec_root
+            .as_ref()
+            .map(|value| value.trim())
+            .filter(|value| !value.is_empty())
+        {
+            let spec_path = Path::new(spec_root);
+            if spec_path.is_absolute() && spec_path != self.workspace_path.as_path() {
+                cmd.arg("--add-dir");
+                cmd.arg(spec_root);
+            }
+        }
+
+        // Custom arguments
+        if let Some(ref args) = self.custom_args {
+            for arg in args.split_whitespace() {
+                cmd.arg(arg);
+            }
+        }
+
+        // Set up stdio - always pipe stdin so we can write responses
+        // for AskUserQuestion tool calls mid-stream
+        cmd.stdin(Stdio::piped());
+        cmd.stdout(Stdio::piped());
+        cmd.stderr(Stdio::piped());
+
+        // Environment
+        cmd.env(CLAUDE_NON_INTERACTIVE_ENV, "1");
+        if let Some(ref home) = self.home_dir {
+            cmd.env("CLAUDE_HOME", home);
+        }
+        if params.disable_thinking {
+            cmd.env("CLAUDE_CODE_DISABLE_THINKING", "1");
+        }
+
+        cmd
+    }
+
+    /// Send a message and stream the response
+    pub async fn send_message(
+        &self,
+        params: SendMessageParams,
+        turn_id: &str,
+    ) -> Result<String, String> {
+        match self
+            .send_message_attempt(params.clone(), turn_id, true)
+            .await
+        {
+            Err(error) if Self::is_unknown_include_hook_events_error(&error) => {
+                log::warn!(
+                    "[claude] --include-hook-events unsupported, retrying without hook events: {}",
+                    error
+                );
+                self.send_message_attempt(params, turn_id, false).await
+            }
+            result => result,
+        }
+    }
+
+    async fn send_message_attempt(
+        &self,
+        params: SendMessageParams,
+        turn_id: &str,
+        include_hook_events: bool,
+    ) -> Result<String, String> {
+        if self.is_disposed() {
+            let error_msg = "Claude session disposed; refusing to start new process".to_string();
+            self.emit_turn_event(
+                turn_id,
+                EngineEvent::TurnError {
+                    workspace_id: self.workspace_id.clone(),
+                    error: error_msg.clone(),
+                    code: None,
+                },
+            );
+            self.clear_turn_ephemeral_state(turn_id);
+            return Err(error_msg);
+        }
+
+        // Reset cumulative text tracker for the new turn only.
+        if let Ok(mut map) = self.last_emitted_text_by_turn.lock() {
+            map.remove(turn_id);
+        }
+
+        if let Err(error_msg) = Self::normalized_fork_session_id(&params) {
+            self.emit_turn_event(
+                turn_id,
+                EngineEvent::TurnError {
+                    workspace_id: self.workspace_id.clone(),
+                    error: error_msg.clone(),
+                    code: None,
+                },
+            );
+            self.clear_turn_ephemeral_state(turn_id);
+            return Err(error_msg);
+        }
+
+        let use_stream_json_input = Self::should_use_stream_json_input(&params);
+
+        let mut cmd = self.build_command(&params, use_stream_json_input, include_hook_events);
+        Self::configure_spawn_command(&mut cmd);
+
+        // Spawn the process
+        let mut stream_startup_timing = ClaudeStreamStartupTiming {
+            process_spawn_started_at_ms: Some(unix_timestamp_ms()),
+            ..ClaudeStreamStartupTiming::default()
+        };
+        let mut child = match cmd.spawn() {
+            Ok(child) => child,
+            Err(e) => {
+                let error_msg = format!("Failed to spawn claude: {}", e);
+                self.emit_turn_event(
+                    turn_id,
+                    EngineEvent::TurnError {
+                        workspace_id: self.workspace_id.clone(),
+                        error: error_msg.clone(),
+                        code: None,
+                    },
+                );
+                self.clear_turn_ephemeral_state(turn_id);
+                return Err(error_msg);
+            }
+        };
+        stream_startup_timing.process_spawned_at_ms = Some(unix_timestamp_ms());
+
+        // If stream-json input is enabled, write the message content to stdin.
+        // This path is required for image payloads and multiline text prompts.
+        if use_stream_json_input {
+            if let Some(mut stdin) = child.stdin.take() {
+                stream_startup_timing.stdin_write_started_at_ms = Some(unix_timestamp_ms());
+                let message = match build_message_content(&params) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        drop(stdin);
+                        return self
+                            .fail_send_setup_and_terminate_child(
+                                turn_id,
+                                &mut child,
+                                format!("Failed to build message: {}", error),
+                            )
+                            .await;
+                    }
+                };
+                let message_str = match serde_json::to_string(&message) {
+                    Ok(value) => value,
+                    Err(error) => {
+                        drop(stdin);
+                        return self
+                            .fail_send_setup_and_terminate_child(
+                                turn_id,
+                                &mut child,
+                                format!("Failed to serialize message: {}", error),
+                            )
+                            .await;
+                    }
+                };
+
+                if let Err(error) = stdin.write_all(message_str.as_bytes()).await {
+                    drop(stdin);
+                    return self
+                        .fail_send_setup_and_terminate_child(
+                            turn_id,
+                            &mut child,
+                            format!("Failed to write to stdin: {}", error),
+                        )
+                        .await;
+                }
+                if let Err(error) = stdin.write_all(b"\n").await {
+                    drop(stdin);
+                    return self
+                        .fail_send_setup_and_terminate_child(
+                            turn_id,
+                            &mut child,
+                            format!("Failed to write newline: {}", error),
+                        )
+                        .await;
+                }
+                // Drop stdin to signal EOF
+                drop(stdin);
+                stream_startup_timing.stdin_closed_at_ms = Some(unix_timestamp_ms());
+            } else {
+                return self
+                    .fail_send_setup_and_terminate_child(
+                        turn_id,
+                        &mut child,
+                        "Failed to capture stdin for stream-json mode".to_string(),
+                    )
+                    .await;
+            }
+        } else {
+            // For non-image messages, drop stdin immediately so the CLI
+            // doesn't hang waiting for EOF.
+            drop(child.stdin.take());
+            stream_startup_timing.stdin_closed_at_ms = Some(unix_timestamp_ms());
+        }
+
+        let stdout = match child.stdout.take() {
+            Some(value) => value,
+            None => {
+                return self
+                    .fail_send_setup_and_terminate_child(
+                        turn_id,
+                        &mut child,
+                        "Failed to capture stdout".to_string(),
+                    )
+                    .await;
+            }
+        };
+
+        let stderr = match child.stderr.take() {
+            Some(value) => value,
+            None => {
+                return self
+                    .fail_send_setup_and_terminate_child(
+                        turn_id,
+                        &mut child,
+                        "Failed to capture stderr".to_string(),
+                    )
+                    .await;
+            }
+        };
+
+        // Store child for interruption (per turn)
+        let mut spawned_child = Some(child);
+        {
+            let mut active = self.active_processes.lock().await;
+            if !self.is_disposed() {
+                if let Some(child) = spawned_child.take() {
+                    active.insert(turn_id.to_string(), child);
+                }
+            }
+        }
+        if let Some(mut child) = spawned_child.take() {
+            let _ = self.terminate_child_process(turn_id, &mut child).await;
+            let error_msg =
+                "Claude session disposed during startup; terminated pending child process"
+                    .to_string();
+            self.emit_turn_event(
+                turn_id,
+                EngineEvent::TurnError {
+                    workspace_id: self.workspace_id.clone(),
+                    error: error_msg.clone(),
+                    code: None,
+                },
+            );
+            self.clear_turn_ephemeral_state(turn_id);
+            return Err(error_msg);
+        }
+
+        // Emit session started event
+        self.emit_turn_event(
+            turn_id,
+            EngineEvent::SessionStarted {
+                workspace_id: self.workspace_id.clone(),
+                session_id: "pending".to_string(),
+                engine: EngineType::Claude,
+                turn_id: Some(turn_id.to_string()),
+            },
+        );
+
+        // Emit turn started event
+        stream_startup_timing.turn_started_at_ms = Some(unix_timestamp_ms());
+        self.emit_turn_event(
+            turn_id,
+            EngineEvent::TurnStarted {
+                workspace_id: self.workspace_id.clone(),
+                turn_id: turn_id.to_string(),
+            },
+        );
+
+        // Read stdout line by line
+        let reader = BufReader::new(stdout);
+        let mut lines = reader.lines();
+        let mut response_text = String::new();
+        let mut saw_text_delta = false;
+        let mut new_session_id: Option<String> = None;
+        let mut error_output = String::new();
+        let mut stream_runtime_error: Option<String> = None;
+        let mut stream_error_event_emitted = false;
+        let mut saw_valid_stream_event = false;
+        let first_event_deadline = Instant::now() + CLAUDE_STREAM_FIRST_EVENT_TIMEOUT;
+        let stream_diagnostic_sample = Arc::new(StdMutex::new(String::new()));
+        let text_delta_coalesce_window = if cfg!(windows) {
+            Duration::from_millis(CLAUDE_TEXT_DELTA_COALESCE_WINDOW_MS)
+        } else {
+            Duration::ZERO
+        };
+        let mut pending_text_delta = BufferedClaudeTextDelta::default();
+
+        // Spawn stderr reader
+        let stderr_reader = BufReader::new(stderr);
+        let _workspace_id_clone = self.workspace_id.clone();
+        let stderr_diagnostic_sample = Arc::clone(&stream_diagnostic_sample);
+        let stderr_handle = tokio::spawn(async move {
+            let mut lines = stderr_reader.lines();
+            let mut stderr_text = String::new();
+            while let Ok(Some(line)) = lines.next_line().await {
+                stderr_text.push_str(&line);
+                stderr_text.push('\n');
+                if let Ok(mut sample) = stderr_diagnostic_sample.lock() {
+                    ClaudeSession::push_stream_diagnostic_sample(&mut sample, &line);
+                    ClaudeSession::push_stream_diagnostic_sample(&mut sample, "\n");
+                }
+            }
+            stderr_text
+        });
+
+        // Process stdout events
+        let mut session_id_emitted = false;
+        loop {
+            if pending_text_delta.has_expired(text_delta_coalesce_window) {
+                self.flush_buffered_text_delta(turn_id, &mut pending_text_delta);
+                continue;
+            }
+
+            let next_line = if pending_text_delta.is_empty() {
+                if saw_valid_stream_event {
+                    lines.next_line().await
+                } else {
+                    let wait_duration = first_event_deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or(Duration::ZERO);
+                    match tokio::time::timeout(wait_duration, lines.next_line()).await {
+                        Ok(result) => result,
+                        Err(_) => {
+                            return self
+                                .fail_stream_no_event_timeout(
+                                    turn_id,
+                                    Arc::clone(&stream_diagnostic_sample),
+                                    stderr_handle,
+                                )
+                                .await;
+                        }
+                    }
+                }
+            } else if let Some(wait_duration) =
+                pending_text_delta.remaining_window(text_delta_coalesce_window)
+            {
+                let wait_duration = if saw_valid_stream_event {
+                    wait_duration
+                } else {
+                    let remaining_startup = first_event_deadline
+                        .checked_duration_since(Instant::now())
+                        .unwrap_or(Duration::ZERO);
+                    wait_duration.min(remaining_startup)
+                };
+                match tokio::time::timeout(wait_duration, lines.next_line()).await {
+                    Ok(result) => result,
+                    Err(_) => {
+                        if saw_valid_stream_event {
+                            self.flush_buffered_text_delta(turn_id, &mut pending_text_delta);
+                            continue;
+                        }
+                        return self
+                            .fail_stream_no_event_timeout(
+                                turn_id,
+                                Arc::clone(&stream_diagnostic_sample),
+                                stderr_handle,
+                            )
+                            .await;
+                    }
+                }
+            } else {
+                self.flush_buffered_text_delta(turn_id, &mut pending_text_delta);
+                continue;
+            };
+
+            let Some(line) = (match next_line {
+                Ok(Some(line)) => Some(line),
+                Ok(None) => None,
+                Err(error) => {
+                    self.flush_buffered_text_delta(turn_id, &mut pending_text_delta);
+                    if stream_runtime_error.is_none() {
+                        stream_runtime_error =
+                            Some(format!("Failed to read Claude stream output: {}", error));
+                    }
+                    None
+                }
+            }) else {
+                break;
+            };
+
+            if line.trim().is_empty() {
+                continue;
+            }
+            let line_received_at_ms = unix_timestamp_ms();
+            if stream_startup_timing.first_stdout_line_at_ms.is_none() {
+                stream_startup_timing.first_stdout_line_at_ms = Some(line_received_at_ms);
+            }
+
+            match parse_claude_stream_json_line(&line) {
+                Ok(event) => {
+                    if Self::is_valid_claude_stream_event(&event) {
+                        if stream_startup_timing
+                            .first_valid_stream_event_at_ms
+                            .is_none()
+                        {
+                            stream_startup_timing.first_valid_stream_event_at_ms =
+                                Some(line_received_at_ms);
+                        }
+                        saw_valid_stream_event = true;
+                        self.emit_pending_ask_user_question_resume_success(turn_id);
+                    } else if !saw_valid_stream_event {
+                        if let Ok(mut sample) = stream_diagnostic_sample.lock() {
+                            Self::push_stream_diagnostic_sample(&mut sample, &line);
+                            Self::push_stream_diagnostic_sample(&mut sample, "\n");
+                        }
+                    }
+                    // If Claude only emits a final result without streaming deltas,
+                    // synthesize a text delta so the frontend still renders a reply.
+                    if !saw_text_delta {
+                        if let Some(event_type) = event.get("type").and_then(|v| v.as_str()) {
+                            if event_type == "result" {
+                                if let Some(text) = extract_result_text(&event) {
+                                    if !text.trim().is_empty() {
+                                        saw_text_delta = true;
+                                        if stream_startup_timing.first_text_delta_at_ms.is_none() {
+                                            stream_startup_timing.first_text_delta_at_ms =
+                                                Some(line_received_at_ms);
+                                        }
+                                        response_text.push_str(&text);
+                                        pending_text_delta
+                                            .push_with_timing(&text, Some(line_received_at_ms));
+                                        pending_text_delta
+                                            .set_stream_startup_timing(&stream_startup_timing);
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    // Extract session ID if present and emit event with real session_id
+                    // Check both snake_case (session_id) and camelCase (sessionId) field names
+                    let sid = event
+                        .get("session_id")
+                        .or_else(|| event.get("sessionId"))
+                        .and_then(|v| v.as_str());
+                    if let Some(sid) = sid {
+                        if !sid.is_empty() && sid != "pending" && !session_id_emitted {
+                            new_session_id = Some(sid.to_string());
+                            self.set_session_id(Some(sid.to_string())).await;
+                            session_id_emitted = true;
+                            // Emit SessionStarted with real session_id so frontend can update thread ID
+                            self.emit_turn_event(
+                                turn_id,
+                                EngineEvent::SessionStarted {
+                                    workspace_id: self.workspace_id.clone(),
+                                    session_id: sid.to_string(),
+                                    engine: EngineType::Claude,
+                                    turn_id: Some(turn_id.to_string()),
+                                },
+                            );
+                        }
+                    }
+
+                    // Convert and emit event
+                    if let Some(unified_event) = self.convert_event(turn_id, &event) {
+                        if let EngineEvent::TurnError { ref error, .. } = unified_event {
+                            if stream_runtime_error.is_none() {
+                                stream_runtime_error = Some(error.clone());
+                            }
+                            if Self::is_prompt_too_long_error(error) {
+                                self.flush_buffered_text_delta(turn_id, &mut pending_text_delta);
+                                continue;
+                            }
+                            stream_error_event_emitted = true;
+                        }
+
+                        // Collect text for final response
+                        if let EngineEvent::TextDelta { ref text, .. } = unified_event {
+                            response_text.push_str(text);
+                            saw_text_delta = true;
+                            if stream_startup_timing.first_text_delta_at_ms.is_none() {
+                                stream_startup_timing.first_text_delta_at_ms =
+                                    Some(line_received_at_ms);
+                            }
+                            pending_text_delta.push_with_timing(text, Some(line_received_at_ms));
+                            pending_text_delta.set_stream_startup_timing(&stream_startup_timing);
+                            continue;
+                        }
+
+                        self.flush_buffered_text_delta(turn_id, &mut pending_text_delta);
+                        let is_user_input_request =
+                            matches!(&unified_event, EngineEvent::RequestUserInput { .. });
+
+                        self.emit_turn_event_with_stream_timing(
+                            turn_id,
+                            unified_event,
+                            Some(
+                                stream_startup_timing.to_stream_timing(
+                                    Some(line_received_at_ms),
+                                    unix_timestamp_ms(),
+                                ),
+                            ),
+                        );
+
+                        if self.has_pending_approval_request_for_turn(turn_id) {
+                            match self
+                                .handle_file_approval_resume(
+                                    turn_id,
+                                    &params,
+                                    &new_session_id,
+                                    include_hook_events,
+                                )
+                                .await
+                            {
+                                Ok(Some(new_lines)) => {
+                                    lines = new_lines;
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    self.emit_turn_event(
+                                        turn_id,
+                                        EngineEvent::TurnError {
+                                            workspace_id: self.workspace_id.clone(),
+                                            error: error.clone(),
+                                            code: None,
+                                        },
+                                    );
+                                    self.clear_turn_ephemeral_state(turn_id);
+                                    return Err(error);
+                                }
+                            }
+                        }
+
+                        // When AskUserQuestion is detected, delegate to the
+                        // dedicated handler which waits for user input, kills the
+                        // current CLI, and restarts with --resume.
+                        if is_user_input_request {
+                            match self
+                                .handle_ask_user_question_resume(
+                                    turn_id,
+                                    &params,
+                                    &new_session_id,
+                                    include_hook_events,
+                                )
+                                .await
+                            {
+                                Ok(Some(new_lines)) => {
+                                    lines = new_lines;
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(error) => {
+                                    self.emit_turn_event(
+                                        turn_id,
+                                        EngineEvent::TurnError {
+                                            workspace_id: self.workspace_id.clone(),
+                                            error: error.clone(),
+                                            code: None,
+                                        },
+                                    );
+                                    self.clear_turn_ephemeral_state(turn_id);
+                                    return Err(error);
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_e) => {
+                    let trimmed = line.trim();
+                    if is_claude_stream_control_line(trimmed) {
+                        continue;
+                    }
+                    // Non-JSON output, might be error
+                    error_output.push_str(&line);
+                    error_output.push('\n');
+                    if let Ok(mut sample) = stream_diagnostic_sample.lock() {
+                        Self::push_stream_diagnostic_sample(&mut sample, &line);
+                        Self::push_stream_diagnostic_sample(&mut sample, "\n");
+                    }
+                    if stream_runtime_error.is_none() {
+                        if looks_like_claude_runtime_error(trimmed) {
+                            stream_runtime_error = Some(trimmed.to_string());
+                        }
+                    }
+                }
+            }
+        }
+
+        self.flush_buffered_text_delta(turn_id, &mut pending_text_delta);
+
+        // Wait for process to complete
+        let mut child = {
+            let mut active = self.active_processes.lock().await;
+            active.remove(turn_id)
+        };
+        let status = if let Some(mut child_proc) = child.take() {
+            child_proc.wait().await.ok()
+        } else {
+            None
+        };
+
+        // Get stderr
+        let stderr_text = stderr_handle.await.unwrap_or_default();
+        if !stderr_text.trim().is_empty() {
+            error_output.push_str(&stderr_text);
+        }
+
+        // Update session ID
+        if let Some(sid) = new_session_id {
+            self.set_session_id(Some(sid)).await;
+        }
+
+        // Check for errors - emit TurnError whenever the process exits with
+        // a non-zero status, regardless of whether partial output was received.
+        // Previously this only triggered when response_text was empty, which
+        // caused silent failures when the CLI produced partial output before crashing.
+        if let Some(status) = status {
+            if !status.success() {
+                let error_msg = Self::build_process_exit_error(
+                    status,
+                    &error_output,
+                    &Self::stream_diagnostic_sample_snapshot(&stream_diagnostic_sample),
+                    use_stream_json_input,
+                    include_hook_events,
+                    params.access_mode.as_deref(),
+                );
+
+                if include_hook_events && Self::is_unknown_include_hook_events_error(&error_msg) {
+                    self.clear_turn_ephemeral_state(turn_id);
+                    return Err(error_msg);
+                }
+
+                log::error!("Claude process failed: {}", error_msg);
+                self.emit_pending_ask_user_question_resume_failure(turn_id, &error_msg);
+
+                if Self::is_prompt_too_long_error(&error_msg) {
+                    self.clear_turn_ephemeral_state(turn_id);
+                    return Err(Self::mark_retryable_prompt_too_long_error(&error_msg));
+                }
+
+                if let Some(mode_blocked_event) =
+                    self.build_mode_blocked_signal_from_error(turn_id, &error_msg)
+                {
+                    self.emit_turn_event(turn_id, mode_blocked_event);
+                }
+
+                self.emit_turn_event(
+                    turn_id,
+                    EngineEvent::TurnError {
+                        workspace_id: self.workspace_id.clone(),
+                        error: error_msg.clone(),
+                        code: None,
+                    },
+                );
+
+                self.clear_turn_ephemeral_state(turn_id);
+                return Err(error_msg);
+            }
+        } else {
+            // Process handle was taken by interrupt() or missing.
+            // Check the interrupted flag to distinguish user-initiated interrupts
+            // from unexpected process disappearance.
+            let was_interrupted = self.interrupted.swap(false, Ordering::SeqCst);
+            if was_interrupted {
+                log::info!("Turn {} was interrupted by user", turn_id);
+                self.emit_turn_event(
+                    turn_id,
+                    EngineEvent::TurnError {
+                        workspace_id: self.workspace_id.clone(),
+                        error: "Session stopped.".to_string(),
+                        code: None,
+                    },
+                );
+                self.clear_turn_ephemeral_state(turn_id);
+                return Err("Session stopped.".to_string());
+            }
+            // Not a user interrupt — treat as unexpected termination
+            if response_text.is_empty() {
+                let error_msg = "Claude process terminated unexpectedly".to_string();
+                log::error!("{}", error_msg);
+                self.emit_pending_ask_user_question_resume_failure(turn_id, &error_msg);
+                self.emit_turn_event(
+                    turn_id,
+                    EngineEvent::TurnError {
+                        workspace_id: self.workspace_id.clone(),
+                        error: error_msg.clone(),
+                        code: None,
+                    },
+                );
+                self.clear_turn_ephemeral_state(turn_id);
+                return Err(error_msg);
+            }
+        }
+
+        // Claude may emit an in-stream error while still exiting with code 0.
+        // In that case we must not mark the turn as completed successfully.
+        if let Some(stream_error) = stream_runtime_error {
+            let error_msg = if !error_output.trim().is_empty() {
+                let stderr_text = error_output.trim();
+                format!("{}\n{}", stream_error, stderr_text)
+            } else {
+                stream_error
+            };
+            log::error!("Claude stream reported runtime error: {}", error_msg);
+            self.emit_pending_ask_user_question_resume_failure(turn_id, &error_msg);
+            if Self::is_prompt_too_long_error(&error_msg) {
+                self.clear_turn_ephemeral_state(turn_id);
+                return Err(Self::mark_retryable_prompt_too_long_error(&error_msg));
+            }
+            if !stream_error_event_emitted {
+                self.emit_turn_event(
+                    turn_id,
+                    EngineEvent::TurnError {
+                        workspace_id: self.workspace_id.clone(),
+                        error: error_msg.clone(),
+                        code: None,
+                    },
+                );
+            }
+            self.clear_turn_ephemeral_state(turn_id);
+            return Err(error_msg);
+        }
+
+        if !saw_valid_stream_event {
+            let diagnostic_sample =
+                Self::stream_diagnostic_sample_snapshot(&stream_diagnostic_sample);
+            let error_msg = self.emit_stream_no_valid_event_error(turn_id, &diagnostic_sample);
+            self.emit_pending_ask_user_question_resume_failure(turn_id, &error_msg);
+            self.clear_turn_ephemeral_state(turn_id);
+            return Err(error_msg);
+        }
+
+        // Emit turn completed
+        self.emit_turn_event(
+            turn_id,
+            EngineEvent::TurnCompleted {
+                workspace_id: self.workspace_id.clone(),
+                result: Some(serde_json::json!({
+                    "text": response_text,
+                })),
+            },
+        );
+
+        if let Some(session_id) = self.get_session_id().await {
+            self.emit_context_command_usage_update(turn_id, &session_id, &params)
+                .await;
+        }
+
+        self.clear_turn_ephemeral_state(turn_id);
+        Ok(response_text)
+    }
+
+    async fn terminate_child_process(
+        &self,
+        _turn_id: &str,
+        child: &mut Child,
+    ) -> Result<(), String> {
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Ok(());
+        }
+
+        #[cfg(target_os = "windows")]
+        {
+            if let Some(pid) = child.id() {
+                match crate::utils::async_command("taskkill")
+                    .args(["/PID", &pid.to_string(), "/T", "/F"])
+                    .status()
+                    .await
+                {
+                    Ok(status) if status.success() => {
+                        let _ = child.wait().await;
+                        return Ok(());
+                    }
+                    Ok(status) => {
+                        if matches!(child.try_wait(), Ok(Some(_))) {
+                            return Ok(());
+                        }
+                        log::warn!(
+                            "[claude] taskkill failed for turn={} pid={} status={}",
+                            _turn_id,
+                            pid,
+                            status
+                        );
+                    }
+                    Err(error) => {
+                        log::warn!(
+                            "[claude] taskkill errored for turn={} pid={}: {}",
+                            _turn_id,
+                            pid,
+                            error
+                        );
+                    }
+                }
+            }
+        }
+
+        #[cfg(unix)]
+        {
+            if let Some(pid) = child.id() {
+                let process_group_id = pid as libc::pid_t;
+                let terminate_status = unsafe { libc::kill(-process_group_id, libc::SIGTERM) };
+                if terminate_status != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        log::warn!(
+                            "[claude] killpg(SIGTERM) failed for turn={} pgid={}: {}",
+                            _turn_id,
+                            process_group_id,
+                            error
+                        );
+                    }
+                } else {
+                    sleep(Duration::from_millis(150)).await;
+                }
+
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    let _ = child.wait().await;
+                    return Ok(());
+                }
+
+                let kill_status = unsafe { libc::kill(-process_group_id, libc::SIGKILL) };
+                if kill_status != 0 {
+                    let error = std::io::Error::last_os_error();
+                    if error.raw_os_error() != Some(libc::ESRCH) {
+                        log::warn!(
+                            "[claude] killpg(SIGKILL) failed for turn={} pgid={}: {}",
+                            _turn_id,
+                            process_group_id,
+                            error
+                        );
+                    }
+                }
+
+                if matches!(child.try_wait(), Ok(Some(_))) {
+                    let _ = child.wait().await;
+                    return Ok(());
+                }
+            }
+        }
+
+        if let Err(error) = child.kill().await {
+            if matches!(child.try_wait(), Ok(Some(_))) {
+                return Ok(());
+            }
+            return Err(format!("Failed to kill process: {}", error));
+        }
+        if matches!(child.try_wait(), Ok(Some(_))) {
+            return Ok(());
+        }
+        let _ = child.wait().await;
+        Ok(())
+    }
+
+    /// Interrupt the current operation
+    pub async fn interrupt(&self) -> Result<(), String> {
+        // Set interrupted flag BEFORE killing so send_message() knows this was intentional
+        self.interrupted.store(true, Ordering::SeqCst);
+        let children: Vec<(String, Child)> = {
+            let mut active = self.active_processes.lock().await;
+            active.drain().collect()
+        };
+        let mut first_terminate_error: Option<String> = None;
+        for (turn_id, mut child) in children {
+            if let Err(error) = self.terminate_child_process(&turn_id, &mut child).await {
+                log::warn!(
+                    "[claude] interrupt failed to terminate child for turn={}: {}",
+                    turn_id,
+                    error
+                );
+                if first_terminate_error.is_none() {
+                    first_terminate_error = Some(error);
+                }
+            }
+        }
+        // Clean up tool tracking state that would otherwise leak from interrupted turns.
+        // Use unwrap_or_else to still clear even if the mutex was poisoned by a panic.
+        self.tool_name_by_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.tool_input_by_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.tool_id_by_block_index
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending_tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.last_emitted_text_by_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.user_input_notify_by_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.user_input_answer_by_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.user_input_request_id_by_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.thread_id_by_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending_user_input_resume_diagnostic_by_turn
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.pending_user_inputs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        if let Some(error) = first_terminate_error {
+            return Err(error);
+        }
+        Ok(())
+    }
+
+    /// Interrupt a single turn without affecting other concurrent turns.
+    pub async fn interrupt_turn(&self, turn_id: &str) -> Result<(), String> {
+        self.interrupted.store(true, Ordering::SeqCst);
+        let mut child = {
+            let mut active = self.active_processes.lock().await;
+            active.remove(turn_id)
+        };
+        if let Some(child_proc) = child.as_mut() {
+            self.terminate_child_process(turn_id, child_proc).await?;
+        }
+        self.clear_turn_ephemeral_state(turn_id);
+        Ok(())
+    }
+
+    fn resolve_tool_use_id(&self, block: &Value, index: Option<i64>) -> Option<String> {
+        if let Some(id) = extract_string_field(
+            block,
+            &[
+                "id",
+                "tool_use_id",
+                "toolUseId",
+                "tool_useId",
+                "toolId",
+                "tool_id",
+            ],
+        ) {
+            return Some(id);
+        }
+        index.map(|value| format!("tool-block-{}", value))
+    }
+
+    fn resolve_tool_result_id(
+        &self,
+        turn_id: &str,
+        block: &Value,
+        index: Option<i64>,
+    ) -> Option<String> {
+        if let Some(id) = extract_string_field(
+            block,
+            &["tool_use_id", "toolUseId", "tool_useId", "toolUseID"],
+        ) {
+            return Some(id);
+        }
+        if let Some(mapped) = self.tool_id_for_block_index(turn_id, index) {
+            return Some(mapped);
+        }
+        if let Some(id) = extract_string_field(block, &["tool_id", "toolId", "id"]) {
+            return Some(id);
+        }
+        self.match_pending_tool_result(turn_id, block)
+            .or_else(|| self.latest_pending_tool_id(turn_id))
+    }
+
+    fn cache_tool_name(&self, tool_id: &str, tool_name: &str) {
+        if tool_id.is_empty() || tool_name.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.tool_name_by_id.lock() {
+            map.insert(tool_id.to_string(), tool_name.to_string());
+        }
+    }
+
+    fn peek_tool_name(&self, tool_id: &str) -> Option<String> {
+        if tool_id.is_empty() {
+            return None;
+        }
+        self.tool_name_by_id
+            .lock()
+            .ok()
+            .and_then(|map| map.get(tool_id).cloned())
+    }
+
+    fn take_tool_name(&self, tool_id: &str) -> Option<String> {
+        if tool_id.is_empty() {
+            return None;
+        }
+        self.tool_name_by_id
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(tool_id))
+    }
+
+    fn cache_tool_block_index(&self, turn_id: &str, index: i64, tool_id: &str) {
+        if tool_id.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.tool_id_by_block_index.lock() {
+            map.insert((turn_id.to_string(), index), tool_id.to_string());
+        }
+    }
+
+    fn tool_id_for_block_index(&self, turn_id: &str, index: Option<i64>) -> Option<String> {
+        let index = index?;
+        self.tool_id_by_block_index
+            .lock()
+            .ok()
+            .and_then(|map| map.get(&(turn_id.to_string(), index)).cloned())
+    }
+
+    fn clear_tool_block_index(&self, turn_id: &str, index: Option<i64>) {
+        if let Some(index) = index {
+            if let Ok(mut map) = self.tool_id_by_block_index.lock() {
+                map.remove(&(turn_id.to_string(), index));
+            }
+        }
+    }
+
+    fn clear_tool_block_indices_for_tool(&self, turn_id: &str, tool_id: &str) {
+        if tool_id.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.tool_id_by_block_index.lock() {
+            map.retain(|(mapped_turn_id, _), mapped_tool_id| {
+                !(mapped_turn_id == turn_id && mapped_tool_id == tool_id)
+            });
+        }
+    }
+
+    fn clear_tool_block_tracking(&self, turn_id: &str, tool_id: &str, index: Option<i64>) {
+        self.clear_tool_block_index(turn_id, index);
+        self.clear_tool_block_indices_for_tool(turn_id, tool_id);
+    }
+
+    fn register_pending_tool(
+        &self,
+        turn_id: &str,
+        tool_id: &str,
+        tool_name: &str,
+        input: Option<&Value>,
+    ) {
+        if tool_id.is_empty() || tool_name.is_empty() {
+            return;
+        }
+        let input_signature = input.and_then(tool_input_signature);
+        if let Ok(mut pending) = self.pending_tools.lock() {
+            pending.retain(|entry| entry.tool_id != tool_id);
+            pending.push(PendingClaudeTool {
+                turn_id: turn_id.to_string(),
+                tool_id: tool_id.to_string(),
+                tool_name: tool_name.to_string(),
+                input_signature,
+            });
+        }
+    }
+
+    fn clear_pending_tool(&self, tool_id: &str) {
+        if tool_id.is_empty() {
+            return;
+        }
+        if let Ok(mut pending) = self.pending_tools.lock() {
+            pending.retain(|entry| entry.tool_id != tool_id);
+        }
+    }
+
+    fn match_pending_tool_result(&self, turn_id: &str, block: &Value) -> Option<String> {
+        let tool_name = extract_claude_tool_name(block)?;
+        let input_signature =
+            extract_claude_tool_input(block).and_then(|value| tool_input_signature(&value));
+        let pending = self.pending_tools.lock().ok()?;
+
+        if let Some(expected_input) = input_signature.as_deref() {
+            if let Some(entry) = pending.iter().rev().find(|entry| {
+                entry.turn_id == turn_id
+                    && entry.tool_name == tool_name
+                    && entry.input_signature.as_deref() == Some(expected_input)
+            }) {
+                return Some(entry.tool_id.clone());
+            }
+        }
+
+        pending
+            .iter()
+            .rev()
+            .find(|entry| entry.turn_id == turn_id && entry.tool_name == tool_name)
+            .map(|entry| entry.tool_id.clone())
+    }
+
+    fn latest_pending_tool_id(&self, turn_id: &str) -> Option<String> {
+        let pending = self.pending_tools.lock().ok()?;
+        pending
+            .iter()
+            .rev()
+            .find(|entry| entry.turn_id == turn_id)
+            .map(|entry| entry.tool_id.clone())
+    }
+
+    fn latest_pending_tool_summary(&self, turn_id: &str) -> Option<PendingClaudeToolSummary> {
+        let pending = self.pending_tools.lock().ok()?;
+        pending
+            .iter()
+            .rev()
+            .find(|entry| entry.turn_id == turn_id)
+            .map(|entry| PendingClaudeToolSummary {
+                tool_id: entry.tool_id.clone(),
+                tool_name: entry.tool_name.clone(),
+            })
+    }
+
+    fn build_mode_blocked_signal_from_error(
+        &self,
+        turn_id: &str,
+        error_message: &str,
+    ) -> Option<EngineEvent> {
+        if !looks_like_claude_permission_denial_message(error_message) {
+            return None;
+        }
+
+        let pending_tool = self.latest_pending_tool_summary(turn_id)?;
+        let tool_input = self.peek_tool_input_value(&pending_tool.tool_id);
+        let blocked_kind = classify_claude_mode_blocked_tool(&pending_tool.tool_name)?;
+        let should_emit_synthetic_approval = match blocked_kind {
+            ClaudeModeBlockedKind::FileChange => true,
+            ClaudeModeBlockedKind::CommandExecution => tool_input
+                .as_ref()
+                .and_then(extract_claude_command_string)
+                .as_deref()
+                .map(command_can_apply_as_local_file_action)
+                .unwrap_or(false),
+            ClaudeModeBlockedKind::RequestUserInput => false,
+        };
+
+        if should_emit_synthetic_approval {
+            if let Ok(mut pending) = self.pending_approval_requests.lock() {
+                pending.insert(pending_tool.tool_id.clone(), turn_id.to_string());
+            }
+            return Some(EngineEvent::ApprovalRequest {
+                workspace_id: self.workspace_id.clone(),
+                request_id: Value::String(pending_tool.tool_id.clone()),
+                tool_name: pending_tool.tool_name.clone(),
+                input: tool_input,
+                message: Some(
+                    "Approve to let the GUI apply this file change locally. Preview currently supports structured file tools plus safe single-path file commands.".to_string(),
+                ),
+            });
+        }
+
+        let (blocked_method, reason_code, reason, suggestion) = match blocked_kind {
+            ClaudeModeBlockedKind::RequestUserInput => (
+                "item/tool/requestUserInput",
+                "claude_ask_user_question_permission_denied",
+                "Claude denied AskUserQuestion before any approval request reached the GUI.",
+                "Claude default mode remains gated. Use Plan mode when the workflow needs AskUserQuestion or other interactive clarification.",
+            ),
+            ClaudeModeBlockedKind::FileChange => (
+                "item/fileChange/requestApproval",
+                "claude_file_change_permission_denied",
+                "Claude denied a file-change tool before any GUI approval request could start.",
+                "Claude preview can bridge Write/CreateFile/CreateDirectory after approval. Other file tools still need full-access or a retry after changing Claude Code settings.",
+            ),
+            ClaudeModeBlockedKind::CommandExecution => (
+                "item/commandExecution/requestApproval",
+                "claude_command_execution_permission_denied",
+                "Claude blocked a command-execution tool before any recoverable GUI approval request could start.",
+                "Claude default mode cannot recover blocked Bash/command tools through the GUI approval bridge yet. Retry in full-access or rewrite the action to use supported file tools.",
+            ),
+        };
+
+        Some(EngineEvent::Raw {
+            workspace_id: self.workspace_id.clone(),
+            engine: EngineType::Claude,
+            data: json!({
+                "type": "permission_denied",
+                "source": "claude_permission_denied",
+                "blockedMethod": blocked_method,
+                "blocked_method": blocked_method,
+                "effectiveMode": "code",
+                "effective_mode": "code",
+                "reasonCode": reason_code,
+                "reason_code": reason_code,
+                "reason": reason,
+                "suggestion": suggestion,
+                "requestId": pending_tool.tool_id,
+                "request_id": pending_tool.tool_id,
+                "toolName": pending_tool.tool_name,
+                "tool_name": pending_tool.tool_name,
+                "rawError": error_message,
+                "raw_error": error_message,
+            }),
+        })
+    }
+
+    /// Compute the true delta from a cumulative assistant text.
+    /// If the cumulative text starts with the previously emitted text,
+    /// return only the new portion. Otherwise return the full text
+    /// (this handles edge cases like context compaction).
+    fn compute_text_delta(&self, turn_id: &str, cumulative: &str) -> String {
+        if let Ok(mut map) = self.last_emitted_text_by_turn.lock() {
+            let last = map.entry(turn_id.to_string()).or_default();
+            if cumulative.starts_with(last.as_str()) {
+                let delta = cumulative[last.len()..].to_string();
+                *last = cumulative.to_string();
+                return delta;
+            }
+            if last.starts_with(cumulative) {
+                return String::new();
+            }
+            // Cumulative text doesn't extend the previous — emit full text
+            *last = cumulative.to_string();
+        }
+        cumulative.to_string()
+    }
+
+    /// Keep the emitted-text tracker aligned when Claude streams raw deltas
+    /// before it later sends a cumulative assistant snapshot.
+    fn track_emitted_text_delta(&self, turn_id: &str, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.last_emitted_text_by_turn.lock() {
+            let last = map.entry(turn_id.to_string()).or_default();
+            *last = merge_text_chunks(last, delta);
+        }
+    }
+
+    fn append_tool_input(&self, tool_id: &str, partial: &str) -> Option<Value> {
+        if tool_id.is_empty() || partial.is_empty() {
+            return None;
+        }
+        if let Ok(mut map) = self.tool_input_by_id.lock() {
+            let entry = map.entry(tool_id.to_string()).or_default();
+            entry.push_str(partial);
+            if let Ok(value) = serde_json::from_str::<Value>(entry) {
+                return Some(value);
+            }
+        }
+        None
+    }
+
+    fn cache_tool_input_value(&self, tool_id: &str, input: &Value) {
+        if tool_id.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.tool_input_value_by_id.lock() {
+            map.insert(tool_id.to_string(), input.clone());
+        }
+    }
+
+    fn take_tool_input_value(&self, tool_id: &str) -> Option<Value> {
+        if tool_id.is_empty() {
+            return None;
+        }
+        self.tool_input_value_by_id
+            .lock()
+            .ok()
+            .and_then(|mut map| map.remove(tool_id))
+    }
+
+    fn peek_tool_input_value(&self, tool_id: &str) -> Option<Value> {
+        if tool_id.is_empty() {
+            return None;
+        }
+        self.tool_input_value_by_id
+            .lock()
+            .ok()
+            .and_then(|map| map.get(tool_id).cloned())
+    }
+
+    fn clear_tool_input(&self, tool_id: &str) {
+        if tool_id.is_empty() {
+            return;
+        }
+        if let Ok(mut map) = self.tool_input_by_id.lock() {
+            map.remove(tool_id);
+        }
+        if let Ok(mut map) = self.tool_input_value_by_id.lock() {
+            map.remove(tool_id);
+        }
+    }
+
+    fn take_tool_completion_state(&self, tool_id: &str) -> (Option<String>, Option<Value>) {
+        let tool_name = self.take_tool_name(tool_id);
+        let cached_input = self.take_tool_input_value(tool_id);
+        self.clear_pending_tool(tool_id);
+        self.clear_tool_input(tool_id);
+        (tool_name, cached_input)
+    }
+
+    fn build_tool_completed_with_parts(
+        &self,
+        tool_id: &str,
+        output: Option<String>,
+        error: Option<String>,
+    ) -> Option<EngineEvent> {
+        if tool_id.is_empty() {
+            return None;
+        }
+        let (tool_name, cached_input) = self.take_tool_completion_state(tool_id);
+        let output = output.map(|text| {
+            if let Some(input) = cached_input.clone() {
+                json!({
+                    "_input": input,
+                    "_output": text,
+                })
+            } else {
+                Value::String(text)
+            }
+        });
+        Some(EngineEvent::ToolCompleted {
+            workspace_id: self.workspace_id.clone(),
+            tool_id: tool_id.to_string(),
+            tool_name,
+            output,
+            error,
+        })
+    }
+
+    fn emit_tool_completion(
+        &self,
+        turn_id: &str,
+        tool_id: &str,
+        output: Option<String>,
+        error: Option<String>,
+    ) {
+        if let Some(event) = self.build_tool_completed_with_parts(tool_id, output, error) {
+            self.emit_turn_event(turn_id, event);
+        }
+    }
+
+    fn build_tool_completed(
+        &self,
+        tool_id: &str,
+        output: Option<String>,
+        is_error: bool,
+    ) -> Option<EngineEvent> {
+        let error = if is_error {
+            output.clone().filter(|text| !text.trim().is_empty())
+        } else {
+            None
+        };
+        let output = if is_error { None } else { output };
+        self.build_tool_completed_with_parts(tool_id, output, error)
+    }
+
+    fn build_tool_output_delta(&self, tool_id: &str, delta: &str) -> Option<EngineEvent> {
+        let trimmed = delta.trim_end();
+        if tool_id.is_empty() || trimmed.is_empty() {
+            return None;
+        }
+        Some(EngineEvent::ToolOutputDelta {
+            workspace_id: self.workspace_id.clone(),
+            tool_id: tool_id.to_string(),
+            tool_name: self.peek_tool_name(tool_id),
+            delta: trimmed.to_string(),
+        })
+    }
+}
+
+#[cfg(test)]
+#[path = "claude/tests_command.rs"]
+mod tests_command;
+#[cfg(test)]
+#[path = "claude/tests_context_usage.rs"]
+mod tests_context_usage;
+#[cfg(test)]
+#[path = "claude/tests_core.rs"]
+mod tests_core;
+#[cfg(test)]
+#[path = "claude/tests_mode_blocked.rs"]
+mod tests_mode_blocked;
+#[cfg(test)]
+#[path = "claude/tests_path_approval.rs"]
+mod tests_path_approval;

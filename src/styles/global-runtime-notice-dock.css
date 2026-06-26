@@ -1,0 +1,426 @@
+.global-runtime-notice-dock-shell {
+  position: fixed;
+  left: max(8px, env(safe-area-inset-left, 0px) + 8px);
+  bottom: max(12px, env(safe-area-inset-bottom, 0px) + 12px);
+  z-index: 42;
+}
+
+.sidebar-bottom-nav .global-runtime-notice-dock-shell {
+  position: relative;
+  left: auto;
+  right: auto;
+  bottom: auto;
+  width: 32px;
+  height: 32px;
+  flex: 0 0 32px;
+  z-index: 5;
+}
+
+.global-runtime-notice-dock-bubble {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 32px;
+  height: 32px;
+  padding: 0;
+  border: none;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-muted, #94a3b8);
+  cursor: pointer;
+  transition:
+    background-color 0.16s ease,
+    color 0.16s ease;
+}
+
+.global-runtime-notice-dock-bubble:hover,
+.global-runtime-notice-dock-bubble:focus-visible {
+  background: var(--surface-hover, rgba(148, 163, 184, 0.16));
+  color: var(--text-strong, #f8fafc);
+}
+
+.global-runtime-notice-dock-bubble.is-has-notice {
+  color: #7dd3fc;
+}
+
+.global-runtime-notice-dock-bubble.is-has-error {
+  color: #fda4af;
+}
+
+.global-runtime-notice-dock-indicator {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 16px;
+  height: 16px;
+  color: inherit;
+}
+
+.global-runtime-notice-dock-indicator-icon {
+  width: 16px;
+  height: 16px;
+  display: block;
+}
+
+
+
+.global-runtime-notice-dock {
+  position: absolute;
+  left: 0;
+  bottom: calc(100% + 4px);
+  width: min(960px, calc(100vw - 24px));
+  max-height: min(70vh, calc(100vh - 96px));
+  display: flex;
+  flex-direction: column;
+  border: 1px solid rgba(148, 163, 184, 0.24);
+  border-radius: 18px;
+  background:
+    linear-gradient(180deg, rgba(15, 23, 42, 0.96), rgba(15, 23, 42, 0.9));
+  box-shadow:
+    0 28px 56px rgba(15, 23, 42, 0.34),
+    inset 0 1px 0 rgba(255, 255, 255, 0.08);
+  color: #e2e8f0;
+  overflow: hidden;
+  backdrop-filter: blur(18px);
+}
+
+.global-runtime-notice-dock-portal-layer {
+  position: fixed;
+  inset: 0;
+  z-index: 2200;
+  pointer-events: none;
+}
+
+.global-runtime-notice-dock.is-portal {
+  position: fixed;
+  left: 12px;
+  bottom: 48px;
+  z-index: 2200;
+  pointer-events: auto;
+}
+
+.sidebar-bottom-nav .global-runtime-notice-dock,
+.global-runtime-notice-dock.is-sidebar-popover {
+  width: min(560px, calc(100vw - 24px));
+  max-height: min(360px, calc(100vh - 112px));
+  border-radius: 16px;
+}
+
+.sidebar-bottom-nav .global-runtime-notice-dock-header,
+.global-runtime-notice-dock.is-sidebar-popover .global-runtime-notice-dock-header {
+  padding: 12px 14px;
+}
+
+.sidebar-bottom-nav .global-runtime-notice-dock-title-wrap,
+.global-runtime-notice-dock.is-sidebar-popover .global-runtime-notice-dock-title-wrap {
+  gap: 8px;
+}
+
+.sidebar-bottom-nav .global-runtime-notice-dock-empty,
+.global-runtime-notice-dock.is-sidebar-popover .global-runtime-notice-dock-empty {
+  padding: 18px 14px 20px;
+}
+
+.app.layout-desktop.layout-swapped .sidebar-bottom-nav .global-runtime-notice-dock {
+  left: auto;
+  right: 0;
+}
+
+.global-runtime-notice-dock-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 14px 16px;
+  border-bottom: 1px solid rgba(148, 163, 184, 0.12);
+}
+
+.global-runtime-notice-dock-title-wrap {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  min-width: 0;
+}
+
+.global-runtime-notice-dock-title {
+  font-size: 14px;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+
+.global-runtime-notice-dock-status {
+  display: inline-flex;
+  align-items: center;
+  min-height: 22px;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  background: rgba(148, 163, 184, 0.16);
+  color: #cbd5e1;
+}
+
+.global-runtime-notice-dock-status.is-streaming {
+  background: rgba(56, 189, 248, 0.14);
+  color: #7dd3fc;
+}
+
+.global-runtime-notice-dock-status.is-has-error {
+  background: rgba(248, 113, 113, 0.16);
+  color: #fda4af;
+}
+
+.global-runtime-notice-dock-actions {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.global-runtime-notice-dock-action {
+  padding: 0;
+  border: 0;
+  background: transparent;
+  color: #cbd5e1;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+
+.global-runtime-notice-dock-action:hover {
+  color: #f8fafc;
+}
+
+.global-runtime-notice-dock-list {
+  margin: 0;
+  padding: 10px 12px 12px;
+  list-style: none;
+  overflow: auto;
+  flex: 1 1 auto;
+  min-height: 0;
+}
+
+.global-runtime-notice-dock-row {
+  display: grid;
+  grid-template-columns: 8px minmax(0, 1fr) auto;
+  column-gap: 10px;
+  row-gap: 4px;
+  align-items: start;
+  padding: 8px 6px;
+  border-radius: 10px;
+}
+
+.global-runtime-notice-dock-row + .global-runtime-notice-dock-row {
+  margin-top: 2px;
+}
+
+.global-runtime-notice-dock-row:hover {
+  background: rgba(148, 163, 184, 0.06);
+}
+
+.global-runtime-notice-dock-severity {
+  width: 8px;
+  height: 8px;
+  border-radius: 999px;
+  background: #38bdf8;
+  margin-top: 6px;
+}
+
+.global-runtime-notice-dock-severity.is-warning {
+  background: #f59e0b;
+}
+
+.global-runtime-notice-dock-severity.is-error {
+  background: #f87171;
+}
+
+.global-runtime-notice-dock-message {
+  min-width: 0;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  color: #e2e8f0;
+  font-size: 13px;
+  line-height: 1.5;
+}
+
+.global-runtime-notice-dock-time {
+  align-self: start;
+  white-space: nowrap;
+  color: #94a3b8;
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  letter-spacing: 0.02em;
+}
+
+.global-runtime-notice-dock-empty {
+  padding: 20px 16px 22px;
+}
+
+.global-runtime-notice-dock-empty-title {
+  color: #f8fafc;
+  font-size: 13px;
+  font-weight: 700;
+}
+
+.global-runtime-notice-dock-empty-description {
+  margin-top: 6px;
+  color: #94a3b8;
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock {
+  border-color: rgba(15, 23, 36, 0.08);
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96));
+  box-shadow:
+    0 18px 36px rgba(15, 23, 42, 0.12),
+    inset 0 1px 0 rgba(255, 255, 255, 0.92);
+  color: #1f2937;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-header {
+  border-bottom-color: rgba(15, 23, 36, 0.08);
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-title {
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-status {
+  background: rgba(15, 23, 36, 0.08);
+  color: #475569;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-status.is-streaming {
+  background: rgba(56, 189, 248, 0.14);
+  color: #0f5ec7;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-status.is-has-error {
+  background: rgba(248, 113, 113, 0.14);
+  color: #b91c1c;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-action {
+  color: #475569;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-action:hover {
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-row:hover {
+  background: rgba(15, 23, 36, 0.04);
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-message {
+  color: #1f2937;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-time {
+  color: #64748b;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-empty-title {
+  color: #0f172a;
+}
+
+:root[data-theme="light"] .global-runtime-notice-dock-empty-description {
+  color: #64748b;
+}
+
+@media (prefers-color-scheme: light) {
+  :root[data-theme="system"] .global-runtime-notice-dock,
+  :root:not([data-theme]) .global-runtime-notice-dock {
+    border-color: rgba(15, 23, 36, 0.08);
+    background:
+      linear-gradient(180deg, rgba(255, 255, 255, 0.98), rgba(248, 250, 252, 0.96));
+    box-shadow:
+      0 18px 36px rgba(15, 23, 42, 0.12),
+      inset 0 1px 0 rgba(255, 255, 255, 0.92);
+    color: #1f2937;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-header,
+  :root:not([data-theme]) .global-runtime-notice-dock-header {
+    border-bottom-color: rgba(15, 23, 36, 0.08);
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-title,
+  :root:not([data-theme]) .global-runtime-notice-dock-title {
+    color: #0f172a;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-status,
+  :root:not([data-theme]) .global-runtime-notice-dock-status {
+    background: rgba(15, 23, 36, 0.08);
+    color: #475569;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-status.is-streaming,
+  :root:not([data-theme]) .global-runtime-notice-dock-status.is-streaming {
+    background: rgba(56, 189, 248, 0.14);
+    color: #0f5ec7;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-status.is-has-error,
+  :root:not([data-theme]) .global-runtime-notice-dock-status.is-has-error {
+    background: rgba(248, 113, 113, 0.14);
+    color: #b91c1c;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-action,
+  :root:not([data-theme]) .global-runtime-notice-dock-action {
+    color: #475569;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-action:hover,
+  :root:not([data-theme]) .global-runtime-notice-dock-action:hover {
+    color: #0f172a;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-row:hover,
+  :root:not([data-theme]) .global-runtime-notice-dock-row:hover {
+    background: rgba(15, 23, 36, 0.04);
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-message,
+  :root:not([data-theme]) .global-runtime-notice-dock-message {
+    color: #1f2937;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-time,
+  :root:not([data-theme]) .global-runtime-notice-dock-time {
+    color: #64748b;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-empty-title,
+  :root:not([data-theme]) .global-runtime-notice-dock-empty-title {
+    color: #0f172a;
+  }
+
+  :root[data-theme="system"] .global-runtime-notice-dock-empty-description,
+  :root:not([data-theme]) .global-runtime-notice-dock-empty-description {
+    color: #64748b;
+  }
+}
+
+@media (max-width: 960px) {
+  .global-runtime-notice-dock-shell {
+    left: 12px;
+    right: 12px;
+    bottom: max(78px, env(safe-area-inset-bottom, 0px) + 78px);
+  }
+
+  .sidebar-bottom-nav .global-runtime-notice-dock-shell {
+    left: auto;
+    right: auto;
+    bottom: auto;
+  }
+
+  .global-runtime-notice-dock {
+    width: min(680px, calc(100vw - 16px));
+    max-height: min(60vh, calc(100vh - 120px));
+  }
+}
