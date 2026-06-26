@@ -270,6 +270,7 @@ const defaultSettings: AppSettings = {
   browserAgentEnabled: true,
   browserAgentPreferBuiltIn: true,
   browserAgentAllowExternalProviderFallback: true,
+  userMode: "developer",
 };
 
 const CODEX_WARM_TTL_DEFAULT_SECONDS = 7200;
@@ -466,6 +467,7 @@ function normalizeAppSettings(
     ),
     openAppTargets: normalizedTargets,
     selectedOpenAppId,
+    userMode: settings.userMode === "office" ? "office" : "developer",
   };
 }
 

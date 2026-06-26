@@ -206,6 +206,7 @@ const workspaceB: WorkspaceInfo = {
 
 const baseSettings: AppSettings = {
   claudeBin: null,
+  userMode: "developer",
   codexBin: null,
   codexArgs: null,
   terminalShellPath: null,

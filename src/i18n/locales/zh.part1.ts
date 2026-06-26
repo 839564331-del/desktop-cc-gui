@@ -795,6 +795,8 @@ const zhPart1 = {
 
     // 侧边栏导航
     sidebarBasic: "基础设置",
+    userMode: "使用模式",
+    userModeDesc: "切换到办公模式将隐藏所有开发工具（终端、Git、调试等）。",
     sidebarProviders: "供应商管理",
     sidebarUsage: "使用情况",
     sidebarMcp: "MCP 服务器",

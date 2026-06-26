@@ -871,6 +871,7 @@ export type AppSettings = {
   diffExpandedByDefault?: boolean;
   commitPrompt?: string;
   sendShortcut?: "enter" | "cmdEnter";
+  userMode: "developer" | "office";
 };
 
 export type RuntimePoolState =

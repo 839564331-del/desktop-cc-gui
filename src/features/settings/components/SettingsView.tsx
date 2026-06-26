@@ -1731,34 +1731,38 @@ export function SettingsView({
             <LayoutGrid aria-hidden />
             {!sidebarCollapsed && t("settings.sidebarProjectManagement")}
           </button>
-          <button
-            type="button"
-            className={`settings-nav ${!mcpSectionDisabled && activeSection === "mcp" ? "active" : ""}${mcpSectionDisabled ? " is-disabled" : ""}`}
-            onClick={() => {
-              if (!mcpSectionDisabled) {
-                setActiveSection("mcp");
-              }
-            }}
-            disabled={mcpSectionDisabled}
-            title={sidebarCollapsed ? t("settings.sidebarMcpSkills") : ""}
-          >
-            <Server aria-hidden />
-            {!sidebarCollapsed && t("settings.sidebarMcpSkills")}
-          </button>
-          <button
-            type="button"
-            className={`settings-nav ${!permissionsSectionDisabled && activeSection === "permissions" ? "active" : ""}${permissionsSectionDisabled ? " is-disabled" : ""}`}
-            onClick={() => {
-              if (!permissionsSectionDisabled) {
-                setActiveSection("permissions");
-              }
-            }}
-            disabled={permissionsSectionDisabled}
-            title={sidebarCollapsed ? t("settings.sidebarPermissions") : ""}
-          >
-            <Shield aria-hidden />
-            {!sidebarCollapsed && t("settings.sidebarPermissions")}
-          </button>
+          {appSettings.userMode !== "office" && (
+            <button
+              type="button"
+              className={`settings-nav ${!mcpSectionDisabled && activeSection === "mcp" ? "active" : ""}${mcpSectionDisabled ? " is-disabled" : ""}`}
+              onClick={() => {
+                if (!mcpSectionDisabled) {
+                  setActiveSection("mcp");
+                }
+              }}
+              disabled={mcpSectionDisabled}
+              title={sidebarCollapsed ? t("settings.sidebarMcpSkills") : ""}
+            >
+              <Server aria-hidden />
+              {!sidebarCollapsed && t("settings.sidebarMcpSkills")}
+            </button>
+          )}
+          {appSettings.userMode !== "office" && (
+            <button
+              type="button"
+              className={`settings-nav ${!permissionsSectionDisabled && activeSection === "permissions" ? "active" : ""}${permissionsSectionDisabled ? " is-disabled" : ""}`}
+              onClick={() => {
+                if (!permissionsSectionDisabled) {
+                  setActiveSection("permissions");
+                }
+              }}
+              disabled={permissionsSectionDisabled}
+              title={sidebarCollapsed ? t("settings.sidebarPermissions") : ""}
+            >
+              <Shield aria-hidden />
+              {!sidebarCollapsed && t("settings.sidebarPermissions")}
+            </button>
+          )}
           {SHOW_COMMIT_ENTRY && (
             <button
               type="button"
@@ -1770,17 +1774,19 @@ export function SettingsView({
               {!sidebarCollapsed && t("settings.sidebarCommit")}
             </button>
           )}
-          <button
-            type="button"
-            className={`settings-nav ${activeSection === "agent-prompt-management" ? "active" : ""}`}
-            onClick={() => setActiveSection("agent-prompt-management")}
-            title={
-              sidebarCollapsed ? t("settings.sidebarAgentPromptManagement") : ""
-            }
-          >
-            <span className="codicon codicon-robot" />
-            {!sidebarCollapsed && t("settings.sidebarAgentPromptManagement")}
-          </button>
+          {appSettings.userMode !== "office" && (
+            <button
+              type="button"
+              className={`settings-nav ${activeSection === "agent-prompt-management" ? "active" : ""}`}
+              onClick={() => setActiveSection("agent-prompt-management")}
+              title={
+                sidebarCollapsed ? t("settings.sidebarAgentPromptManagement") : ""
+              }
+            >
+              <span className="codicon codicon-robot" />
+              {!sidebarCollapsed && t("settings.sidebarAgentPromptManagement")}
+            </button>
+          )}
           {SHOW_COMPOSER_ENTRY && (
             <button
               type="button"
@@ -1814,17 +1820,19 @@ export function SettingsView({
               {!sidebarCollapsed && t("settings.sidebarGit")}
             </button>
           )}
-          <button
-            type="button"
-            className={`settings-nav ${activeSection === "runtime-environment" ? "active" : ""}`}
-            onClick={() => setActiveSection("runtime-environment")}
-            title={
-              sidebarCollapsed ? t("settings.sidebarRuntimeEnvironment") : ""
-            }
-          >
-            <TerminalSquare aria-hidden />
-            {!sidebarCollapsed && t("settings.sidebarRuntimeEnvironment")}
-          </button>
+          {appSettings.userMode !== "office" && (
+            <button
+              type="button"
+              className={`settings-nav ${activeSection === "runtime-environment" ? "active" : ""}`}
+              onClick={() => setActiveSection("runtime-environment")}
+              title={
+                sidebarCollapsed ? t("settings.sidebarRuntimeEnvironment") : ""
+              }
+            >
+              <TerminalSquare aria-hidden />
+              {!sidebarCollapsed && t("settings.sidebarRuntimeEnvironment")}
+            </button>
+          )}
           <button
             type="button"
             className={`settings-nav ${activeSection === "other" ? "active" : ""}`}

@@ -117,6 +117,29 @@ export function BasicBehaviorSection({
 
   return (
     <div className="settings-basic-behavior settings-basic-surface">
+      <Card className="settings-basic-group-card settings-basic-shadcn-card">
+        <CardHeader className="settings-card-switch-header">
+          <div className="settings-card-switch-meta">
+            <CardTitle className="settings-toggle-title">
+              {t("settings.userMode")}
+            </CardTitle>
+            <CardDescription className="settings-toggle-subtitle">
+              {t("settings.userModeDesc")}
+            </CardDescription>
+          </div>
+          <CardAction className="settings-card-switch-action">
+            <Switch
+              checked={appSettings.userMode === "office"}
+              onCheckedChange={(checked) =>
+                void onUpdateAppSettings({
+                  ...appSettings,
+                  userMode: checked ? "office" : "developer",
+                })
+              }
+            />
+          </CardAction>
+        </CardHeader>
+      </Card>
       <div className="settings-basic-group-card">
         <div className="settings-subsection-title">{t("settings.sendShortcutSubtitle")}</div>
         <div className="settings-subsection-subtitle">

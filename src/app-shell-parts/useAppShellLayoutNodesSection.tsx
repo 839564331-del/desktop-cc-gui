@@ -536,6 +536,12 @@ export function useAppShellLayoutNodesSection(
     runningSessionCountByWorkspaceId,
     recentCompletedSessionCountByWorkspaceId,
   } = ctx;
+  const isOffice = appSettings.userMode === "office";
+  useEffect(() => {
+    if (isOffice && centerMode !== "chat") {
+      setCenterMode("chat");
+    }
+  }, [isOffice, centerMode, setCenterMode]);
   const pendingIntentCanvasDocuments = useMemo(
     () =>
       activeThreadId
@@ -885,22 +891,30 @@ export function useAppShellLayoutNodesSection(
     rightPanelCollapsed,
     sidebarToggleProps: mainHeaderSidebarToggleProps,
     showRuntimeConsoleButton:
-      !isCompact && clientUiVisibility.isControlVisible("topTool.runtimeConsole"),
+      !isOffice &&
+      !isCompact &&
+      clientUiVisibility.isControlVisible("topTool.runtimeConsole"),
     isRuntimeConsoleVisible: runtimeRunState.runtimeConsoleVisible,
     onToggleRuntimeConsole: handleToggleRuntimeConsole,
     showTerminalButton:
-      !isCompact && clientUiVisibility.isControlVisible("topTool.terminal"),
+      !isOffice &&
+      !isCompact &&
+      clientUiVisibility.isControlVisible("topTool.terminal"),
     isTerminalOpen: terminalOpen,
     onToggleTerminal: handleToggleTerminalPanel,
     showSoloButton:
-      soloModeEnabled && clientUiVisibility.isControlVisible("topTool.focus"),
+      !isOffice &&
+      soloModeEnabled &&
+      clientUiVisibility.isControlVisible("topTool.focus"),
     isSoloMode,
     onToggleSoloMode: toggleSoloMode,
     isBrowserDockOpen: browserDockOpen,
-    onToggleBrowserDock: clientUiVisibility.isControlVisible("topTool.browserDock")
-      ? handleToggleBrowserDock
-      : undefined,
+    onToggleBrowserDock:
+      !isOffice && clientUiVisibility.isControlVisible("topTool.browserDock")
+        ? handleToggleBrowserDock
+        : undefined,
     showClientDocumentationButton:
+      !isOffice &&
       !isCompact &&
       clientUiVisibility.isControlVisible("topTool.clientDocumentation"),
     onOpenClientDocumentation: handleOpenClientDocumentation,
@@ -1915,16 +1929,16 @@ export function useAppShellLayoutNodesSection(
     tabletNavNode,
     tabBarNode,
     rightPanelToolbarNode,
-    gitDiffPanelNode,
-    gitDiffViewerNode,
-    fileViewPanelNode,
-    projectMapPanelNode,
-    intentCanvasPanelNode,
-    browserDockNode,
-    planPanelNode,
-    debugPanelNode,
+    gitDiffPanelNode: isOffice ? null : gitDiffPanelNode,
+    gitDiffViewerNode: isOffice ? null : gitDiffViewerNode,
+    fileViewPanelNode: isOffice ? null : fileViewPanelNode,
+    projectMapPanelNode: isOffice ? null : projectMapPanelNode,
+    intentCanvasPanelNode: isOffice ? null : intentCanvasPanelNode,
+    browserDockNode: isOffice ? null : browserDockNode,
+    planPanelNode: isOffice ? null : planPanelNode,
+    debugPanelNode: isOffice ? null : debugPanelNode,
     debugPanelFullNode,
-    terminalDockNode,
+    terminalDockNode: isOffice ? null : terminalDockNode,
     compactEmptyCodexNode,
     compactEmptySpecNode,
     compactEmptyGitNode,

@@ -699,6 +699,8 @@ const enPart1 = {
 
     // Sidebar navigation
     sidebarBasic: "Basic Settings",
+    userMode: "Usage Mode",
+    userModeDesc: "Switching to Office hides all developer tools (terminal, Git, debug, etc.).",
     sidebarProviders: "Providers",
     sidebarUsage: "Usage",
     sidebarMcp: "MCP Servers",
