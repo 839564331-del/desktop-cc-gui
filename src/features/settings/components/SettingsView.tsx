@@ -1763,7 +1763,7 @@ export function SettingsView({
               {!sidebarCollapsed && t("settings.sidebarPermissions")}
             </button>
           )}
-          {SHOW_COMMIT_ENTRY && (
+          {SHOW_COMMIT_ENTRY && appSettings.userMode !== "office" && (
             <button
               type="button"
               className={`settings-nav ${activeSection === "commit" ? "active" : ""}`}
@@ -1809,7 +1809,7 @@ export function SettingsView({
               {!sidebarCollapsed && t("settings.sidebarDictation")}
             </button>
           )}
-          {SHOW_GIT_ENTRY && (
+          {SHOW_GIT_ENTRY && appSettings.userMode !== "office" && (
             <button
               type="button"
               className={`settings-nav ${activeSection === "git" ? "active" : ""}`}
@@ -1842,7 +1842,7 @@ export function SettingsView({
             <MoreHorizontalIcon aria-hidden />
             {!sidebarCollapsed && t("settings.sidebarOther")}
           </button>
-          {SHOW_EXPERIMENTAL_ENTRY && (
+          {SHOW_EXPERIMENTAL_ENTRY && appSettings.userMode !== "office" && (
             <>
               <button
                 type="button"
