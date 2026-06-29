@@ -27,3 +27,26 @@ export function getDefaultWorkspaceCandidatePaths(homePath: string): string[] {
   }
   return DEFAULT_WORKSPACE_SUFFIXES.map((suffix) => `${normalizedHomePath}${suffix}`);
 }
+
+// Office (white-collar) mode uses a visible directory under the user's Documents,
+// not the hidden .ccgui/workspace used by developer mode.
+const OFFICE_DEFAULT_WORKSPACE_SUFFIXES = ["/Documents/AI助手"];
+
+export function isOfficeDefaultWorkspacePath(path: string): boolean {
+  const normalized = normalizeWorkspacePath(path);
+  return OFFICE_DEFAULT_WORKSPACE_SUFFIXES.some((suffix) =>
+    normalized.endsWith(suffix.toLowerCase()),
+  );
+}
+
+export function getOfficeDefaultWorkspaceCandidatePaths(
+  homePath: string,
+): string[] {
+  const normalizedHomePath = normalizeWorkspaceHomePath(homePath);
+  if (!normalizedHomePath) {
+    return [];
+  }
+  return OFFICE_DEFAULT_WORKSPACE_SUFFIXES.map(
+    (suffix) => `${normalizedHomePath}${suffix}`,
+  );
+}

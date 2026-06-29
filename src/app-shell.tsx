@@ -202,9 +202,11 @@ export function AppShell() {
     workspacesByPath,
   } = useAppShellWorkspaceHomeState({
     activeWorkspaceId,
+    addWorkspaceFromPath,
     appSettingsLoading,
     groupedWorkspaces,
     hasLoaded,
+    userMode: appSettings.userMode,
     workspaces,
   });
   const {

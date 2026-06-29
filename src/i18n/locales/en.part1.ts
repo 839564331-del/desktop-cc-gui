@@ -138,6 +138,23 @@ const enPart1 = {
     updated: "Updated",
   },
 
+  office: {
+    home: {
+      dailyWork: "Daily Work",
+      dailyWorkDesc: "Tell me what you need and I'll help",
+      experts: "Expert Assistants",
+      recentSessions: "Recent Sessions",
+      noRecentSessions: "No recent sessions",
+    },
+    expert: {
+      writing: "Writing",
+      summary: "Summary",
+      spreadsheet: "Spreadsheet",
+      translate: "Translation",
+      productDesign: "Product Design",
+      finance: "Finance",
+    },
+  },
   homeChat: {
     badge: "Workspace-aware chat home",
     minimalTitle: "Create anything",

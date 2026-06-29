@@ -14,6 +14,7 @@ import {
 import { useTranslation } from "react-i18next";
 import { Sidebar } from "../../app/components/Sidebar";
 import { HomeChat } from "../../home/components/HomeChat";
+import { OfficeHome } from "../../office/components/OfficeHome";
 import { MainHeader } from "../../app/components/MainHeader";
 import { Messages } from "../../messages/components/Messages";
 import { MessageForkConfirmDialog } from "../../messages/components/MessageForkConfirmDialog";
@@ -1263,7 +1264,13 @@ export function useLayoutNodes(
     options.workspaces,
   );
 
-  const homeNode = (
+  const homeNode = isOffice ? (
+    <OfficeHome
+      latestAgentRuns={options.latestAgentRuns}
+      onSelectThread={options.onSelectHomeThread}
+      composerNode={homeComposerNode}
+    />
+  ) : (
     <HomeChat
       latestAgentRuns={options.latestAgentRuns}
       isLoadingLatestAgents={options.isLoadingLatestAgents}

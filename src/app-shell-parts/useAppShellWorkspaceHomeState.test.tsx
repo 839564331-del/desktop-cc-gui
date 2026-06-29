@@ -17,9 +17,11 @@ vi.mock("../services/perfBaseline/startupMarkers", () => ({
 function createParams(overrides: Partial<Parameters<typeof useAppShellWorkspaceHomeState>[0]> = {}) {
   return {
     activeWorkspaceId: null,
+    addWorkspaceFromPath: async () => null,
     appSettingsLoading: false,
     groupedWorkspaces: [],
     hasLoaded: true,
+    userMode: "developer" as const,
     workspaces: [],
     ...overrides,
   };

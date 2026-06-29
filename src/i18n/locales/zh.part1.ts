@@ -253,6 +253,23 @@ const zhPart1 = {
     updated: "更新于",
   },
 
+  office: {
+    home: {
+      dailyWork: "日常办公",
+      dailyWorkDesc: "告诉我你想做什么，我来帮你",
+      experts: "专家助手",
+      recentSessions: "最近会话",
+      noRecentSessions: "暂无最近会话",
+    },
+    expert: {
+      writing: "写作",
+      summary: "总结",
+      spreadsheet: "表格",
+      translate: "翻译",
+      productDesign: "产品设计",
+      finance: "金融投资",
+    },
+  },
   homeChat: {
     badge: "Workspace-aware chat home",
     minimalTitle: "创造任何东西",
