@@ -193,7 +193,7 @@ type SidebarProps = {
   onLockPanel?: () => void;
   onOpenProjectMemory: () => void;
   onOpenReleaseNotes: () => void;
-  onOpenSpecHub: () => void;
+  onOpenSpecHub?: () => void;
   onOpenWorkspaceHome: () => void;
   onOpenGlobalSearch: () => void;
   globalSearchShortcut: string | null;

@@ -18,7 +18,7 @@ type SidebarSettingsMenuProps = {
   onClose: () => void;
   onOpenSkillsComingSoon: () => void;
   onLockPanel?: () => void;
-  onOpenSpecHub: () => void;
+  onOpenSpecHub?: () => void;
   onOpenProjectMemory: () => void;
   onOpenReleaseNotes: () => void;
   onOpenSettings: () => void;
@@ -74,18 +74,20 @@ export function SidebarSettingsMenu({
             <Lock size={14} aria-hidden />
             <span>{t("lockScreen.lock")}</span>
           </button>
-          <button
-            type="button"
-            role="menuitem"
-            className="sidebar-settings-dropdown-item"
-            onClick={() => {
-              onClose();
-              onOpenSpecHub();
-            }}
-          >
-            <LayoutDashboard size={14} aria-hidden />
-            <span>{t("sidebar.specHub")}</span>
-          </button>
+          {onOpenSpecHub ? (
+            <button
+              type="button"
+              role="menuitem"
+              className="sidebar-settings-dropdown-item"
+              onClick={() => {
+                onClose();
+                onOpenSpecHub();
+              }}
+            >
+              <LayoutDashboard size={14} aria-hidden />
+              <span>{t("sidebar.specHub")}</span>
+            </button>
+          ) : null}
           <button
             type="button"
             role="menuitem"

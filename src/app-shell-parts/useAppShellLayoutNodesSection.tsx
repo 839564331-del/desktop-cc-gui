@@ -1432,7 +1432,7 @@ export function useAppShellLayoutNodesSection(
       latestAgentRuns,
       isLoadingLatestAgents,
       onSelectHomeThread: handleSelectWorkspaceInstance,
-      onOpenSpecHub: handleOpenSpecHub,
+      onOpenSpecHub: isOffice ? undefined : handleOpenSpecHub,
       showLoadingProgressDialog,
       hideLoadingProgressDialog,
       activeWorkspace,
