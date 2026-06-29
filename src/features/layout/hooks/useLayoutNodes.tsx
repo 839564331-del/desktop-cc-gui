@@ -260,7 +260,10 @@ function flattenLayoutNodesOptions(
   };
 }
 
-export function useLayoutNodes(input: LayoutNodesOptions): LayoutNodesResult {
+export function useLayoutNodes(
+  input: LayoutNodesOptions,
+  isOffice = false,
+): LayoutNodesResult {
   const options = flattenLayoutNodesOptions(input);
   const { t } = useTranslation();
   const clientUiVisibility = useClientUiVisibility();
@@ -330,10 +333,9 @@ export function useLayoutNodes(input: LayoutNodesOptions): LayoutNodesResult {
   const showTopSessionTabs =
     clientUiVisibility.isPanelVisible("topSessionTabs");
   const showTopRunControls =
-    clientUiVisibility.isControlVisible("topRun.start");
-  const showOpenWorkspaceAppControl = clientUiVisibility.isControlVisible(
-    "topTool.openWorkspace",
-  );
+    clientUiVisibility.isControlVisible("topRun.start") && !isOffice;
+  const showOpenWorkspaceAppControl =
+    clientUiVisibility.isControlVisible("topTool.openWorkspace") && !isOffice;
   const showRightActivityToolbar = clientUiVisibility.isPanelVisible(
     "rightActivityToolbar",
   );

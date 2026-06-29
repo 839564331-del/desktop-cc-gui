@@ -1913,7 +1913,7 @@ export function useAppShellLayoutNodesSection(
       toggleGitDiffListViewShortcut: appSettings.toggleGitDiffListViewShortcut,
       onOpenWorkspaceHome: handleOpenWorkspaceHome,
     },
-  });
+  }, isOffice);
 
   return {
     sidebarNode,
