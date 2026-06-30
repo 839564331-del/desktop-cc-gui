@@ -866,6 +866,10 @@ fn default_engine_enabled() -> bool {
     true
 }
 
+fn default_user_mode() -> String {
+    "developer".to_string()
+}
+
 fn default_opencode_enabled() -> bool {
     false
 }
@@ -896,6 +900,8 @@ fn default_email_inbound_action_window_hours() -> i64 {
 
 #[derive(Debug, Serialize, Deserialize, Clone)]
 pub(crate) struct AppSettings {
+    #[serde(default = "default_user_mode", rename = "userMode")]
+    pub(crate) user_mode: String,
     #[serde(default, rename = "codexBin")]
     pub(crate) codex_bin: Option<String>,
     #[serde(default, rename = "claudeBin")]
